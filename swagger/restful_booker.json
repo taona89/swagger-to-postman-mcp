@@ -1,0 +1,589 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Restful Booker",
+    "version": "1.0.0",
+    "description": "A hotel booking API for practising REST API testing. Base URL: https://restful-booker.herokuapp.com"
+  },
+  "servers": [
+    {
+      "url": "https://restful-booker.herokuapp.com",
+      "description": "Production server"
+    }
+  ],
+  "paths": {
+    "/auth": {
+      "post": {
+        "summary": "Create Token",
+        "description": "Creates a new auth token to use for access to the PUT and PATCH endpoints.",
+        "operationId": "createToken",
+        "tags": ["Auth"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthRequest"
+              },
+              "example": {
+                "username": "admin",
+                "password": "password123"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/booking": {
+      "get": {
+        "summary": "GetBookingIds",
+        "description": "Returns the ids of all the bookings that exist within the API. Can take optional query strings to search and return a subset of booking ids.",
+        "operationId": "getBookingIds",
+        "tags": ["Booking"],
+        "parameters": [
+          {
+            "name": "firstname",
+            "in": "query",
+            "description": "Return bookings with a specific firstname",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "example": "Josh"
+            }
+          },
+          {
+            "name": "lastname",
+            "in": "query",
+            "description": "Return bookings with a specific lastname",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "example": "Allen"
+            }
+          },
+          {
+            "name": "checkin",
+            "in": "query",
+            "description": "Return bookings that have a checkin date greater than or equal to the set checkin date",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "example": "2014-03-13"
+            }
+          },
+          {
+            "name": "checkout",
+            "in": "query",
+            "description": "Return bookings that have a checkout date greater than or equal to the set checkout date",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "example": "2014-05-21"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of booking IDs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BookingId"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "CreateBooking",
+        "description": "Creates a new booking in the API.",
+        "operationId": "createBooking",
+        "tags": ["Booking"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Booking"
+              },
+              "example": {
+                "firstname": "Jim",
+                "lastname": "Brown",
+                "totalprice": 111,
+                "depositpaid": true,
+                "bookingdates": {
+                  "checkin": "2018-01-01",
+                  "checkout": "2019-01-01"
+                },
+                "additionalneeds": "Breakfast"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Booking created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingCreatedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - invalid body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable entity - missing required fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/booking/{id}": {
+      "get": {
+        "summary": "GetBooking",
+        "description": "Returns a specific booking based upon the booking id provided.",
+        "operationId": "getBooking",
+        "tags": ["Booking"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id of the booking you would like to retrieve",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "example": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Booking details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Booking"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Booking not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "UpdateBooking",
+        "description": "Updates a current booking with a new set of data.",
+        "operationId": "updateBooking",
+        "tags": ["Booking"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id of the booking you would like to update",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "example": 1
+            }
+          },
+          {
+            "name": "Cookie",
+            "in": "header",
+            "description": "Auth token cookie: token=<tokenvalue>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "description": "Basic auth header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Booking"
+              },
+              "example": {
+                "firstname": "James",
+                "lastname": "Brown",
+                "totalprice": 111,
+                "depositpaid": true,
+                "bookingdates": {
+                  "checkin": "2018-01-01",
+                  "checkout": "2019-01-01"
+                },
+                "additionalneeds": "Breakfast"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Booking updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Booking"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden - auth token not supplied or invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "PartialUpdateBooking",
+        "description": "Updates a current booking with a partial payload.",
+        "operationId": "partialUpdateBooking",
+        "tags": ["Booking"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id of the booking you would like to partially update",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "example": 1
+            }
+          },
+          {
+            "name": "Cookie",
+            "in": "header",
+            "description": "Auth token cookie: token=<tokenvalue>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookingPartial"
+              },
+              "example": {
+                "firstname": "James",
+                "lastname": "Brown"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Booking partially updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Booking"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden - auth token not supplied or invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "DeleteBooking",
+        "description": "Returns a 201 response with the message 'Created' when the booking has been deleted.",
+        "operationId": "deleteBooking",
+        "tags": ["Booking"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id of the booking you would like to delete",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "example": 1
+            }
+          },
+          {
+            "name": "Cookie",
+            "in": "header",
+            "description": "Auth token cookie: token=<tokenvalue>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Booking deleted"
+          },
+          "403": {
+            "description": "Forbidden - auth token not supplied or invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Booking not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ping": {
+      "get": {
+        "summary": "HealthCheck",
+        "description": "A simple health check endpoint to confirm whether the API is up and running.",
+        "operationId": "healthCheck",
+        "tags": ["Ping"],
+        "responses": {
+          "201": {
+            "description": "API is up and running"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AuthRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": {
+            "type": "string",
+            "example": "admin"
+          },
+          "password": {
+            "type": "string",
+            "example": "password123"
+          }
+        }
+      },
+      "AuthResponse": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "example": "abc123"
+          }
+        }
+      },
+      "BookingId": {
+        "type": "object",
+        "properties": {
+          "bookingid": {
+            "type": "integer",
+            "example": 1
+          }
+        }
+      },
+      "BookingDates": {
+        "type": "object",
+        "required": ["checkin", "checkout"],
+        "properties": {
+          "checkin": {
+            "type": "string",
+            "format": "date",
+            "example": "2018-01-01"
+          },
+          "checkout": {
+            "type": "string",
+            "format": "date",
+            "example": "2019-01-01"
+          }
+        }
+      },
+      "Booking": {
+        "type": "object",
+        "required": ["firstname", "lastname", "totalprice", "depositpaid", "bookingdates"],
+        "properties": {
+          "firstname": {
+            "type": "string",
+            "example": "Jim"
+          },
+          "lastname": {
+            "type": "string",
+            "example": "Brown"
+          },
+          "totalprice": {
+            "type": "integer",
+            "example": 111
+          },
+          "depositpaid": {
+            "type": "boolean",
+            "example": true
+          },
+          "bookingdates": {
+            "$ref": "#/components/schemas/BookingDates"
+          },
+          "additionalneeds": {
+            "type": "string",
+            "example": "Breakfast"
+          }
+        }
+      },
+      "BookingPartial": {
+        "type": "object",
+        "properties": {
+          "firstname": {
+            "type": "string",
+            "example": "James"
+          },
+          "lastname": {
+            "type": "string",
+            "example": "Brown"
+          },
+          "totalprice": {
+            "type": "integer",
+            "example": 111
+          },
+          "depositpaid": {
+            "type": "boolean",
+            "example": true
+          },
+          "bookingdates": {
+            "$ref": "#/components/schemas/BookingDates"
+          },
+          "additionalneeds": {
+            "type": "string",
+            "example": "Breakfast"
+          }
+        }
+      },
+      "BookingCreatedResponse": {
+        "type": "object",
+        "properties": {
+          "bookingid": {
+            "type": "integer",
+            "example": 1
+          },
+          "booking": {
+            "$ref": "#/components/schemas/Booking"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "example": "Bad credentials"
+          }
+        }
+      }
+    }
+  }
+}

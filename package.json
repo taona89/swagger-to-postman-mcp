@@ -1,0 +1,40 @@
+{
+  "name": "swagger-to-postman-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server that generates Postman collections (positive and negative tests) from OpenAPI/Swagger specifications",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "swagger-to-postman-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node test-generator.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "openapi",
+    "swagger",
+    "postman",
+    "api-testing",
+    "test-generation",
+    "automation"
+  ],
+  "author": "API Test Team",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "js-yaml": "^4.1.0",
+    "swagger-parser": "^10.0.3",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "newman": "^6.2.2",
+    "newman-reporter-htmlextra": "^1.23.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
