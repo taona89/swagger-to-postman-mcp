@@ -1,409 +1,281 @@
-import SwaggerParser from 'swagger-parser';
-import fs from 'fs';
-import yaml from 'js-yaml';
+import SwaggerParser from '@apidevtools/swagger-parser';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { OpenAPIWrapper } from '../utils/openapi-wrapper.js';
+import { generateExample } from '../core/schema.js';
+
+const METHODS = ['get', 'post', 'put', 'patch', 'delete'];
+const PARAM_SCHEMA_KEYS = [
+  'type', 'format', 'items', 'enum', 'default', 'minimum', 'maximum', 'exclusiveMinimum',
+  'exclusiveMaximum', 'minLength', 'maxLength', 'pattern', 'minItems', 'maxItems', 'multipleOf',
+];
+
+function toFilePath(url) {
+  if (/^file:/i.test(url)) return fileURLToPath(url);
+  return path.resolve(url);
+}
+
+function isInside(root, target) {
+  const rel = path.relative(root, target);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
 
 /**
- * OpenAPI/Swagger Parser
- * Extracts endpoints, schemas, and operations from OpenAPI specifications
+ * $ref resolution options: HTTP refs are never fetched (SSRF), and file refs are
+ * only followed when they stay inside the directory of the root spec file.
+ */
+function refOptions(baseDir) {
+  return {
+    resolve: {
+      http: false,
+      file: {
+        canRead: file => {
+          if (!/^file:|^[a-z]:[\\/]|^\//i.test(file.url) && !path.isAbsolute(file.url)) return false;
+          return isInside(baseDir, toFilePath(file.url));
+        },
+      },
+    },
+    dereference: { circular: true },
+  };
+}
+
+function pickMediaType(content) {
+  const types = Object.keys(content || {});
+  return types.find(t => t === 'application/json')
+    || types.find(t => /\+json$|\/json/i.test(t))
+    || types.find(t => t === 'application/x-www-form-urlencoded')
+    || types.find(t => t === 'multipart/form-data')
+    || types[0]
+    || null;
+}
+
+function firstExample(examples) {
+  if (!examples || typeof examples !== 'object') return undefined;
+  const first = Object.values(examples)[0];
+  return first && typeof first === 'object' && 'value' in first ? first.value : undefined;
+}
+
+function substituteServerVariables(server) {
+  if (!server?.url) return '';
+  return server.url.replace(/\{([^}]+)\}/g, (match, name) => server.variables?.[name]?.default ?? match);
+}
+
+/**
+ * OpenAPI / Swagger parser.
+ * Produces one normalized model for OpenAPI 3.x and Swagger 2.0 documents, with
+ * every internal $ref dereferenced (schemas may contain cycles).
  */
 export class OpenAPIParser {
-  constructor() {
-    this.spec = null;
-    this.endpoints = [];
-    this.schemas = {};
-    this.authSchemes = [];
+  /** Load the raw document: .txt partial specs are wrapped in memory, never written to disk. */
+  async load(input) {
+    if (typeof input === 'string' && /\.txt$/i.test(input)) {
+      return { basePath: path.resolve(input), api: await OpenAPIWrapper.wrapPartialSpec(input) };
+    }
+    if (typeof input === 'string') return { basePath: path.resolve(input), api: null };
+    return { basePath: path.resolve('openapi.json'), api: input };
   }
 
   /**
-   * Parse OpenAPI specification from file or URL
+   * Validate a spec against the OpenAPI / Swagger schema.
+   * @returns {Promise<{ valid: boolean, errors: string[], info?: object }>}
    */
-  async parse(specPath) {
+  async validate(input) {
+    const { basePath, api } = await this.load(input);
     try {
-      // Try manual YAML parsing first (faster and avoids swagger-parser issues)
-      console.log('📖 Reading spec file...');
-      const fileContent = fs.readFileSync(specPath, 'utf8');
+      const source = api ? structuredClone(api) : basePath;
+      const validated = await SwaggerParser.validate(basePath, source, refOptions(path.dirname(basePath)));
+      return { valid: true, errors: [], info: validated.info || {} };
+    } catch (error) {
+      const errors = String(error.message || error)
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .slice(0, 50);
+      return { valid: false, errors };
+    }
+  }
 
-      if (specPath.endsWith('.yaml') || specPath.endsWith('.yml')) {
-        this.spec = yaml.load(fileContent);
-      } else {
-        this.spec = JSON.parse(fileContent);
-      }
-      console.log('✅ Spec file parsed');
-
-      // Extract information
-      console.log('🔍 Extracting endpoints...');
-      this.extractEndpoints();
-      console.log('✅ Endpoints extracted:', this.endpoints.length);
-
-      console.log('🔍 Extracting schemas...');
-      this.extractSchemas();
-      console.log('✅ Schemas extracted:', Object.keys(this.schemas).length);
-
-      console.log('🔍 Extracting auth schemes...');
-      this.extractAuthSchemes();
-      console.log('✅ Auth schemes extracted:', this.authSchemes.length);
-
-      return {
-        info: this.spec.info || {},
-        baseUrl: this.getBaseUrl(),
-        endpoints: this.endpoints,
-        schemas: this.schemas,
-        authSchemes: this.authSchemes
-      };
+  async parse(input) {
+    let api;
+    try {
+      const { basePath, api: loaded } = await this.load(input);
+      api = await SwaggerParser.dereference(basePath, loaded ?? basePath, refOptions(path.dirname(basePath)));
     } catch (error) {
       throw new Error(`Failed to parse OpenAPI spec: ${error.message}`);
     }
+    return this.normalize(api);
   }
 
-  /**
-   * Extract all endpoints from the spec
-   */
-  extractEndpoints() {
-    this.endpoints = [];
+  normalize(api) {
+    const swagger2 = typeof api.swagger === 'string';
+    const authSchemes = this.extractAuthSchemes(api, swagger2);
+    const globalSecurity = Array.isArray(api.security) ? api.security : null;
+    const endpoints = [];
 
-    if (!this.spec.paths) {
-      return;
-    }
+    for (const [routePath, pathItem] of Object.entries(api.paths || {})) {
+      if (!pathItem || typeof pathItem !== 'object') continue;
+      for (const method of METHODS) {
+        const operation = pathItem[method];
+        if (!operation) continue;
+        const rawParams = this.mergeParameters(pathItem.parameters, operation.parameters);
+        const security = Array.isArray(operation.security) ? operation.security : globalSecurity;
+        const requirement = security?.find(req => Object.keys(req || {}).length > 0);
 
-    for (const [path, pathItem] of Object.entries(this.spec.paths)) {
-      for (const [method, operation] of Object.entries(pathItem)) {
-        if (['get', 'post', 'put', 'patch', 'delete'].includes(method.toLowerCase())) {
-          this.endpoints.push({
-            path,
-            method: method.toUpperCase(),
-            operationId: operation.operationId || `${method}_${path.replace(/\//g, '_')}`,
-            summary: operation.summary || '',
-            description: operation.description || '',
-            tags: operation.tags || [],
-            parameters: this.extractParameters(operation, pathItem),
-            requestBody: this.extractRequestBody(operation),
-            responses: this.extractResponses(operation),
-            security: operation.security || pathItem.security || this.spec.security || []
-          });
-        }
+        endpoints.push({
+          key: `${method.toUpperCase()} ${routePath}`,
+          path: routePath,
+          method: method.toUpperCase(),
+          operationId: operation.operationId || `${method}_${routePath}`.replace(/[^a-z0-9_]/gi, '_'),
+          summary: operation.summary || '',
+          description: operation.description || '',
+          tags: Array.isArray(operation.tags) ? operation.tags : [],
+          parameters: rawParams
+            .filter(p => !['body', 'formData'].includes(p.in))
+            .map(p => this.normalizeParameter(p, swagger2)),
+          requestBody: swagger2
+            ? this.swagger2RequestBody(rawParams, operation, api)
+            : this.openApiRequestBody(operation),
+          responses: swagger2
+            ? this.swagger2Responses(operation, api)
+            : this.openApiResponses(operation),
+          // null → the spec does not say whether this operation needs auth
+          security: security ?? null,
+          requiresAuth: security ? security.length > 0 && !security.some(req => Object.keys(req || {}).length === 0) : undefined,
+          authSchemeKey: requirement ? Object.keys(requirement)[0] : null,
+        });
       }
-    }
-  }
-
-  /**
-   * Extract parameters (path, query, header)
-   */
-  extractParameters(operation, pathItem) {
-    const params = [];
-
-    // Path-level parameters
-    if (pathItem.parameters) {
-      params.push(...pathItem.parameters);
-    }
-
-    // Operation-level parameters
-    if (operation.parameters) {
-      params.push(...operation.parameters);
-    }
-
-    return params.map(param => ({
-      name: param.name,
-      in: param.in,
-      required: param.required || false,
-      schema: param.schema || {},
-      description: param.description || '',
-      example: param.example || this.generateExample(param.schema)
-    }));
-  }
-
-  /**
-   * Extract request body schema
-   */
-  extractRequestBody(operation) {
-    if (!operation.requestBody) {
-      return null;
-    }
-
-    const content = operation.requestBody.content || {};
-    const jsonContent = content['application/json'] || content['application/x-www-form-urlencoded'];
-
-    if (!jsonContent) {
-      return null;
     }
 
     return {
-      required: operation.requestBody.required || false,
-      schema: jsonContent.schema || {},
-      example: jsonContent.example || this.generateExampleFromSchema(jsonContent.schema)
+      specVersion: swagger2 ? `swagger-${api.swagger}` : `openapi-${api.openapi}`,
+      info: {
+        title: api.info?.title || 'API',
+        version: api.info?.version || '1.0.0',
+        description: api.info?.description || '',
+      },
+      baseUrl: this.baseUrl(api, swagger2),
+      endpoints,
+      schemas: (swagger2 ? api.definitions : api.components?.schemas) || {},
+      authSchemes,
+      securityDeclared: globalSecurity !== null || endpoints.some(e => e.security !== null),
     };
   }
 
-  /**
-   * Extract response schemas
-   */
-  extractResponses(operation) {
-    const responses = {};
-
-    if (!operation.responses) {
-      return responses;
+  mergeParameters(pathLevel = [], operationLevel = []) {
+    const merged = new Map();
+    for (const param of [...(pathLevel || []), ...(operationLevel || [])]) {
+      if (param && param.name) merged.set(`${param.in}:${param.name}`, param);
     }
+    return [...merged.values()];
+  }
 
-    for (const [statusCode, response] of Object.entries(operation.responses)) {
-      const content = response.content || {};
-      const jsonContent = content['application/json'];
+  normalizeParameter(param, swagger2) {
+    let schema = param.schema;
+    if (!schema && swagger2) {
+      schema = Object.fromEntries(PARAM_SCHEMA_KEYS.filter(k => param[k] !== undefined).map(k => [k, param[k]]));
+    }
+    schema = schema || {};
+    const example = param.example ?? param['x-example'] ?? firstExample(param.examples) ?? schema.example;
+    return {
+      name: param.name,
+      in: param.in,
+      required: param.in === 'path' ? true : !!param.required,
+      schema,
+      description: param.description || '',
+      example,
+    };
+  }
 
-      responses[statusCode] = {
-        description: response.description || '',
-        schema: jsonContent?.schema || {},
-        example: jsonContent?.example || null
+  openApiRequestBody(operation) {
+    const body = operation.requestBody;
+    if (!body?.content) return null;
+    const contentType = pickMediaType(body.content);
+    if (!contentType) return null;
+    const media = body.content[contentType] || {};
+    const schema = media.schema || {};
+    const example = media.example ?? firstExample(media.examples) ?? generateExample(schema, { mode: 'request' });
+    return { required: !!body.required, contentType, schema, example };
+  }
+
+  swagger2RequestBody(params, operation, api) {
+    const consumes = operation.consumes || api.consumes || [];
+    const bodyParam = params.find(p => p.in === 'body');
+    if (bodyParam) {
+      const contentType = consumes.find(t => /json/i.test(t)) || consumes[0] || 'application/json';
+      const schema = bodyParam.schema || {};
+      const example = bodyParam['x-example'] ?? generateExample(schema, { mode: 'request' });
+      return { required: !!bodyParam.required, contentType, schema, example };
+    }
+    const formParams = params.filter(p => p.in === 'formData');
+    if (formParams.length === 0) return null;
+    const schema = {
+      type: 'object',
+      properties: Object.fromEntries(formParams.map(p => [p.name, this.normalizeParameter(p, true).schema])),
+      required: formParams.filter(p => p.required).map(p => p.name),
+    };
+    const multipart = formParams.some(p => p.type === 'file') || consumes.includes('multipart/form-data');
+    return {
+      required: formParams.some(p => p.required),
+      contentType: multipart ? 'multipart/form-data' : 'application/x-www-form-urlencoded',
+      schema,
+      example: generateExample(schema, { mode: 'request' }),
+    };
+  }
+
+  openApiResponses(operation) {
+    const responses = {};
+    for (const [code, response] of Object.entries(operation.responses || {})) {
+      const contentType = pickMediaType(response?.content);
+      const media = contentType ? response.content[contentType] : null;
+      responses[code] = {
+        description: response?.description || '',
+        contentType,
+        schema: media?.schema || null,
+        example: media?.example ?? firstExample(media?.examples) ?? null,
       };
     }
-
     return responses;
   }
 
-  /**
-   * Extract schemas/models
-   */
-  extractSchemas() {
-    this.schemas = this.spec.components?.schemas || {};
+  swagger2Responses(operation, api) {
+    const produces = operation.produces || api.produces || ['application/json'];
+    const responses = {};
+    for (const [code, response] of Object.entries(operation.responses || {})) {
+      const schema = response?.schema || null;
+      responses[code] = {
+        description: response?.description || '',
+        contentType: schema ? (produces.find(t => /json/i.test(t)) || produces[0]) : null,
+        schema,
+        example: response?.examples?.['application/json'] ?? null,
+      };
+    }
+    return responses;
   }
 
-  /**
-   * Extract authentication schemes
-   */
-  extractAuthSchemes() {
-    this.authSchemes = [];
-
-    const securitySchemes = this.spec.components?.securitySchemes || {};
-
-    for (const [name, scheme] of Object.entries(securitySchemes)) {
-      this.authSchemes.push({
-        name,
-        type: scheme.type,
-        scheme: scheme.scheme,
+  extractAuthSchemes(api, swagger2) {
+    const definitions = (swagger2 ? api.securityDefinitions : api.components?.securitySchemes) || {};
+    return Object.entries(definitions).map(([key, scheme]) => {
+      let type = scheme.type;
+      let httpScheme = scheme.scheme ? String(scheme.scheme).toLowerCase() : undefined;
+      if (swagger2 && type === 'basic') { type = 'http'; httpScheme = 'basic'; }
+      return {
+        key,                       // name of the scheme in securitySchemes
+        type,                      // http | apiKey | oauth2 | openIdConnect
+        scheme: httpScheme,        // bearer | basic (http only)
         bearerFormat: scheme.bearerFormat,
-        in: scheme.in,
-        description: scheme.description || ''
-      });
-    }
+        in: scheme.in,             // header | query | cookie (apiKey only)
+        paramName: scheme.name,    // actual header / query / cookie name (apiKey only)
+        description: scheme.description || '',
+      };
+    });
   }
 
-  /**
-   * Get base URL from servers
-   */
-  getBaseUrl() {
-    if (this.spec.servers && this.spec.servers.length > 0) {
-      return this.spec.servers[0].url;
+  baseUrl(api, swagger2) {
+    if (swagger2) {
+      if (!api.host) return api.basePath || '';
+      const scheme = api.schemes?.[0] || 'https';
+      return `${scheme}://${api.host}${api.basePath || ''}`;
     }
-
-    // Fallback to Swagger 2.0 format
-    if (this.spec.host) {
-      const scheme = this.spec.schemes?.[0] || 'https';
-      const basePath = this.spec.basePath || '';
-      return `${scheme}://${this.spec.host}${basePath}`;
-    }
-
-    return '{{baseUrl}}';
-  }
-
-  /**
-   * Generate example value from schema
-   * @param {object} schema - JSON Schema object
-   * @param {number} depth - recursion depth
-   * @param {WeakSet} seen - cycle detection
-   * @param {string} propName - property name (used for smart heuristics)
-   */
-  generateExample(schema, depth = 0, seen = new WeakSet(), propName = '') {
-    // Prevent infinite recursion
-    if (depth > 10) return null;
-    if (!schema) return null;
-    if (typeof schema === 'object' && seen.has(schema)) return null;
-    if (typeof schema === 'object') seen.add(schema);
-
-    if (schema.example !== undefined) {
-      return schema.example;
-    }
-
-    // Use default only if it's not an empty string
-    if (schema.default !== undefined && schema.default !== '') {
-      return schema.default;
-    }
-
-    switch (schema.type) {
-      case 'string':
-        if (schema.format === 'uuid') return '550e8400-e29b-41d4-a716-446655440000';
-        if (schema.format === 'date') return '2024-01-15';
-        if (schema.format === 'date-time') return '2024-01-15T10:00:00Z';
-        if (schema.format === 'email') return 'test@example.com';
-        if (schema.enum) return schema.enum[0];
-        return this.generateSmartStringValue(propName);
-      case 'number':
-      case 'integer':
-        return schema.minimum || 1;
-      case 'boolean':
-        return true;
-      case 'array':
-        return schema.items ? [this.generateExample(schema.items, depth + 1, seen, propName)] : [];
-      case 'object':
-        return this.generateExampleFromSchema(schema, depth + 1, seen);
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * Generate a realistic string value based on property name heuristics.
-   * Appends Postman's {{$timestamp}} dynamic variable for uniqueness per run.
-   */
-  generateSmartStringValue(propName) {
-    if (!propName) return 'test_value_{{$timestamp}}';
-
-    const lower = propName.toLowerCase();
-
-    // Name-like fields — unique per run
-    if (lower === 'name' || lower.endsWith('_name') || lower.endsWith('name'))
-      return 'Test Name_{{$timestamp}}';
-    if (lower === 'title')
-      return 'Test Title_{{$timestamp}}';
-    if (lower === 'label')
-      return 'Test Label_{{$timestamp}}';
-    if (lower === 'username' || lower === 'user_name')
-      return 'testuser_{{$timestamp}}';
-    if (lower === 'firstname' || lower === 'first_name')
-      return 'TestFirst_{{$timestamp}}';
-    if (lower === 'lastname' || lower === 'last_name')
-      return 'TestLast_{{$timestamp}}';
-
-    // Description / text fields — unique per run
-    if (lower === 'description' || lower === 'desc')
-      return 'Auto-generated description_{{$timestamp}}';
-    if (lower === 'comment' || lower === 'comments' || lower === 'note' || lower === 'notes')
-      return 'Test comment_{{$timestamp}}';
-    if (lower === 'reason')
-      return 'Test reason_{{$timestamp}}';
-    if (lower === 'message' || lower === 'msg')
-      return 'Test message_{{$timestamp}}';
-    if (lower === 'summary')
-      return 'Test summary_{{$timestamp}}';
-    if (lower === 'body' || lower === 'content' || lower === 'text')
-      return 'Test content_{{$timestamp}}';
-
-    // Identifiers — unique per run
-    if (lower === 'code' || lower.endsWith('_code'))
-      return 'TEST_{{$timestamp}}';
-    if (lower === 'key' || lower.endsWith('_key'))
-      return 'test_key_{{$timestamp}}';
-    if (lower === 'slug')
-      return 'test-slug-{{$timestamp}}';
-    if (lower === 'sku')
-      return 'SKU_{{$timestamp}}';
-    if (lower === 'reference' || lower === 'ref')
-      return 'REF_{{$timestamp}}';
-
-    // Contact / address — fixed values (no timestamp)
-    if (lower === 'email' || lower.endsWith('_email'))
-      return 'test@example.com';
-    if (lower === 'phone' || lower === 'phonenumber' || lower === 'phone_number')
-      return '+1-555-0100';
-    if (lower === 'address' || lower.endsWith('_address'))
-      return '123 Test Street';
-    if (lower === 'city')
-      return 'Test City';
-    if (lower === 'state' || lower === 'province')
-      return 'CA';
-    if (lower === 'country' || lower === 'country_code')
-      return 'US';
-    if (lower === 'zipcode' || lower === 'zip_code' || lower === 'zip' || lower === 'postalcode' || lower === 'postal_code')
-      return '90210';
-
-    // URLs — fixed values
-    if (lower === 'url' || lower === 'website' || lower === 'link' || lower.endsWith('_url'))
-      return 'https://example.com';
-    if (lower === 'image' || lower === 'avatar' || lower === 'photo' || lower.endsWith('_image') || lower.endsWith('_url'))
-      return 'https://example.com/image.png';
-
-    // Status / type — fixed values
-    if (lower === 'status')
-      return 'active';
-    if (lower === 'type' || lower.endsWith('_type'))
-      return 'default';
-    if (lower === 'role')
-      return 'user';
-    if (lower === 'priority')
-      return 'medium';
-    if (lower === 'color' || lower === 'colour')
-      return '#3498db';
-
-    // Fallback — unique per run
-    return `test_${lower}_{{$timestamp}}`;
-  }
-
-  /**
-   * Generate example object from schema
-   */
-  generateExampleFromSchema(schema, depth = 0, seen = new WeakSet()) {
-    // Prevent infinite recursion
-    if (depth > 10) return {};
-    if (!schema) return {};
-    if (typeof schema === 'object' && seen.has(schema)) return {};
-    if (typeof schema === 'object') seen.add(schema);
-
-    if (schema.example) {
-      return schema.example;
-    }
-
-    if (schema.type === 'object' && schema.properties) {
-      const example = {};
-      for (const [propName, propSchema] of Object.entries(schema.properties)) {
-        example[propName] = this.generateExample(propSchema, depth + 1, seen, propName);
-      }
-      return example;
-    }
-
-    if (schema.type === 'array' && schema.items) {
-      return [this.generateExample(schema.items, depth + 1, seen)];
-    }
-
-    return this.generateExample(schema, depth + 1, seen);
-  }
-
-  /**
-   * Get required fields from schema
-   */
-  getRequiredFields(schema) {
-    if (!schema || !schema.properties) {
-      return [];
-    }
-    return schema.required || [];
-  }
-
-  /**
-   * Identify CRUD operations
-   */
-  identifyCRUDOperations() {
-    const crud = {
-      create: [],
-      read: [],
-      update: [],
-      delete: [],
-      list: []
-    };
-
-    for (const endpoint of this.endpoints) {
-      const { method, path, operationId, summary } = endpoint;
-      const lowerSummary = (summary + operationId).toLowerCase();
-
-      if (method === 'POST') {
-        crud.create.push(endpoint);
-      } else if (method === 'GET') {
-        if (path.includes('{') || lowerSummary.includes('get') || lowerSummary.includes('retrieve')) {
-          crud.read.push(endpoint);
-        } else {
-          crud.list.push(endpoint);
-        }
-      } else if (method === 'PUT' || method === 'PATCH') {
-        crud.update.push(endpoint);
-      } else if (method === 'DELETE') {
-        crud.delete.push(endpoint);
-      }
-    }
-
-    return crud;
+    return substituteServerVariables(api.servers?.[0]);
   }
 }

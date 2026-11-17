@@ -1,80 +1,91 @@
 /**
- * Validates that all generated Postman test scripts have valid JavaScript syntax.
- * Uses Function constructor to parse without executing.
+ * Validates Postman scripts: JavaScript syntax (compiled with the Function
+ * constructor, never executed) plus warnings for APIs that can send data off
+ * the machine or execute dynamic code. Use it before running collections that
+ * came from somewhere else.
  */
+
+const SUSPICIOUS = [
+  [/pm\.sendRequest\s*\(/, 'pm.sendRequest (sends an extra HTTP request)'],
+  [/\beval\s*\(/, 'eval (executes dynamic code)'],
+  [/\bnew\s+Function\s*\(|\bFunction\s*\(/, 'Function constructor (executes dynamic code)'],
+  [/\brequire\s*\(/, 'require (loads sandbox modules)'],
+  [/\bfetch\s*\(|XMLHttpRequest/, 'network access'],
+  [/pm\.(environment|globals|collectionVariables)\.toObject\s*\(/, 'reads every variable at once'],
+];
 
 export class ScriptChecker {
   /**
-   * @param {object} positiveCollection - Postman positive collection JSON
-   * @param {object} negativeCollection - Postman negative collection JSON
-   * @returns {{ total: number, valid: number, errors: Array<{ request: string, folder: string, error: string }> }}
+   * @returns {{ total:number, valid:number, errors:Array<{request,folder,error}>, warnings:Array<{request,folder,warning}> }}
    */
   check(positiveCollection, negativeCollection) {
-    const positiveResults = this.checkCollection(positiveCollection, 'Positive');
-    const negativeResults = this.checkCollection(negativeCollection, 'Negative');
-
-    const total = positiveResults.total + negativeResults.total;
-    const valid = positiveResults.valid + negativeResults.valid;
-    const errors = [...positiveResults.errors, ...negativeResults.errors];
-
-    return { total, valid, errors };
+    const results = [
+      this.checkCollection(positiveCollection, 'Positive'),
+      this.checkCollection(negativeCollection, 'Negative'),
+    ];
+    return {
+      total: results.reduce((n, r) => n + r.total, 0),
+      valid: results.reduce((n, r) => n + r.valid, 0),
+      errors: results.flatMap(r => r.errors),
+      warnings: results.flatMap(r => r.warnings),
+    };
   }
 
-  /**
-   * Check all scripts in a single collection.
-   */
   checkCollection(collection, collectionName) {
     let total = 0;
     let valid = 0;
     const errors = [];
+    const warnings = [];
 
-    const walk = (items, folderPath = '') => {
-      if (!items) return;
-      for (const item of items) {
-        if (item.item) {
-          // Folder
-          walk(item.item, item.name || folderPath);
-        } else if (item.event) {
-          // Request with scripts
-          for (const event of item.event) {
-            if (event.script && event.script.exec) {
-              total++;
-              const scriptLines = Array.isArray(event.script.exec)
-                ? event.script.exec
-                : [event.script.exec];
-              const script = scriptLines.join('\n');
-
-              const error = this.checkSyntax(script);
-              if (error) {
-                errors.push({
-                  request: item.name || 'Unknown',
-                  folder: `${collectionName} > ${folderPath}`,
-                  error,
-                });
-              } else {
-                valid++;
-              }
-            }
-          }
+    const inspect = (events, request, folder) => {
+      for (const event of events || []) {
+        if (!event.script?.exec) continue;
+        total++;
+        const script = Array.isArray(event.script.exec) ? event.script.exec.join('\n') : String(event.script.exec);
+        const error = this.checkSyntax(script);
+        if (error) errors.push({ request, folder, error });
+        else valid++;
+        const code = this.withoutPlainStrings(script);
+        for (const [pattern, warning] of SUSPICIOUS) {
+          if (pattern.test(code)) warnings.push({ request, folder, warning: `${event.listen} script uses ${warning}` });
         }
       }
     };
 
-    walk(collection.item);
-    return { total, valid, errors };
+    const walk = (items, folderPath) => {
+      for (const item of items || []) {
+        if (item.item) {
+          inspect(item.event, item.name || 'folder', folderPath);
+          walk(item.item, `${folderPath} > ${item.name || ''}`);
+        } else {
+          inspect(item.event, item.name || 'Unknown', folderPath);
+        }
+      }
+    };
+
+    if (collection) {
+      inspect(collection.event, '(collection)', collectionName);
+      walk(collection.item, collectionName);
+    }
+    return { total, valid, errors, warnings };
   }
 
   /**
-   * Check JavaScript syntax without executing.
-   * Returns error message string, or null if valid.
+   * Blank out the contents of '...' and "..." literals so text inside strings
+   * (test titles, ids) is not mistaken for calls. Template literals are kept,
+   * because ${...} inside them is executable code.
    */
+  withoutPlainStrings(script) {
+    return script.replace(/(["'])(?:\\.|(?!\1)[^\\\r\n])*\1/g, '""');
+  }
+
+  /** Returns the syntax error message, or null when the script compiles. */
   checkSyntax(script) {
     try {
-      // Function constructor parses but does not execute
-      new Function(script);
+      new Function(script); // compiles only; the function is never called
       return null;
-    } catch (e) {
-      return e.message;
+    } catch (error) {
+      return error.message;
     }
   }
 }

@@ -1,641 +1,184 @@
-import { v4 as uuidv4 } from 'uuid';
+import {
+  categorizeEndpoints, negativeExpectation, NEGATIVE_SCENARIOS, BODY_METHODS, codesLabel,
+} from '../core/endpoints.js';
+import { buildRequest } from '../core/request.js';
+import { flattenSchema, schemaType, wrongTypeValue, forbidsEmptyString } from '../core/schema.js';
+import { SuiteBuilder, depth } from './suite-builder.js';
 import { TestScriptGenerator } from './test-script-generator.js';
+
+const MAX_FIELD_TESTS = 25;
+const NON_EXISTENT_UUID = 'ffffffff-ffff-4fff-bfff-ffffffffffff';
 
 /**
  * Negative Test Generator
- * Generates Postman collection for negative test scenarios (error cases, validation)
+ *
+ * Each test changes exactly one thing in an otherwise valid request (valid
+ * credentials, valid ids of resources created in setup, valid body), so a
+ * rejection can only be caused by the fault under test.
+ *
+ * Status oracle: the codes that are correct for the scenario (e.g. 400/422 for
+ * a missing field) intersected with the codes the spec documents. When the spec
+ * documents none of them, the conventional codes are asserted and the operation
+ * is reported as a spec gap.
  */
-export class NegativeTestGenerator {
-  constructor(apiSpec) {
-    this.apiSpec = apiSpec;
-    this.collection = null;
-    this.authEndpoint = this.detectAuthEndpoint();
-    this.authHeader = this.buildAuthHeader();
+export class NegativeTestGenerator extends SuiteBuilder {
+  constructor(apiSpec, options = {}) {
+    super(apiSpec, options);
+    /** [{ operation, scenario, assertedCodes }] — scenarios the spec does not document. */
+    this.specGaps = [];
   }
 
-  /**
-   * Detect the auth endpoint from the spec (POST /auth, /login, /token, etc.)
-   */
-  detectAuthEndpoint() {
-    const authPaths = ['/auth', '/login', '/signin', '/sign-in', '/token',
-                       '/oauth/token', '/authenticate', '/session'];
-    return this.apiSpec.endpoints.find(e =>
-      e.method === 'POST' &&
-      authPaths.some(p => e.path.toLowerCase() === p ||
-                          e.path.toLowerCase().endsWith(p))
-    ) || null;
-  }
-
-  /**
-   * Build the auth header object based on the spec's securitySchemes.
-   */
-  buildAuthHeader() {
-    const schemes = this.apiSpec.authSchemes;
-
-    if (schemes && schemes.length > 0) {
-      const scheme = schemes[0];
-      if (scheme.type === 'http' && scheme.scheme === 'bearer') {
-        return { key: 'Authorization', value: 'Bearer {{token}}', type: 'text' };
-      }
-      if (scheme.type === 'apiKey' && scheme.in === 'header') {
-        return { key: scheme.name || 'x-api-key', value: '{{apiKey}}', type: 'text' };
-      }
-      if (scheme.type === 'apiKey' && scheme.in === 'cookie') {
-        return { key: 'Cookie', value: `${scheme.name || 'token'}={{token}}`, type: 'text' };
-      }
-    }
-
-    if (this.authEndpoint) {
-      return { key: 'Cookie', value: 'token={{token}}', type: 'text' };
-    }
-
-    return null;
-  }
-
-  /**
-   * Build the auth setup request item
-   */
-  generateAuthSetupItem() {
-    const authScheme = this.apiSpec.authSchemes[0] || null;
-    const headers = [{ key: 'Content-Type', value: 'application/json', type: 'text' }];
-    const request = {
-      method: this.authEndpoint.method,
-      header: headers,
-      url: this.buildUrl(this.authEndpoint, {})
-    };
-
-    if (this.authEndpoint.requestBody) {
-      request.body = {
-        mode: 'raw',
-        raw: JSON.stringify(this.authEndpoint.requestBody.example, null, 2),
-        options: { raw: { language: 'json' } }
-      };
-    }
-
-    return {
-      name: '0. Authenticate',
-      description: 'Obtain auth token and store it in the environment for all subsequent requests.',
-      event: [{
-        listen: 'test',
-        script: {
-          exec: TestScriptGenerator.generateAuthSetupScript(authScheme),
-          type: 'text/javascript'
-        }
-      }],
-      request
-    };
-  }
-
-  /**
-   * Generate complete negative test collection
-   */
   generate() {
-    this.collection = {
-      info: {
-        _postman_id: uuidv4(),
-        name: `${this.apiSpec.info.title || 'API'} - Negative Test Suite`,
-        description: `Comprehensive negative test scenarios for ${this.apiSpec.info.title}. Tests invalid inputs, missing fields, unauthorized access, malformed data, and error handling.`,
-        schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json'
-      },
-      variable: this.generateCollectionVariables(),
-      item: []
-    };
+    const crud = categorizeEndpoints(this.apiSpec.endpoints, this.auth.authEndpoint);
+    const bindings = [...this.plan.bindings.values()].filter(b => b.runtime)
+      .sort((a, b) => a.prefix.split('/').length - b.prefix.split('/').length);
 
-    // Add setup folder for getting valid IDs
-    this.collection.item.push(this.generateSetupFolder());
-
-    // Generate negative test folders for each endpoint
-    this.generateNegativeFolders();
-
-    return this.collection;
-  }
-
-  /**
-   * Generate collection variables
-   */
-  generateCollectionVariables() {
-    return [
-      {
-        key: 'baseUrl',
-        value: this.apiSpec.baseUrl || '{{baseUrl}}',
-        type: 'string'
+    // Setup: credentials + one disposable resource per creatable collection
+    const setup = this.auth.authEndpoint ? [this.authItem()] : [];
+    for (const binding of bindings) {
+      if (binding.createOp) {
+        setup.push(this.positiveItem(binding.createOp, {
+          name: `Create disposable resource: POST ${binding.createOp.path}`,
+          capture: this.createCapture(binding.createOp),
+        }));
+      } else if (binding.listOp) {
+        setup.push(this.positiveItem(binding.listOp, {
+          name: `Find an existing id: GET ${binding.listOp.path}`,
+          capture: this.listCapture(binding.listOp),
+        }));
       }
-    ];
-  }
-
-  /**
-   * Generate setup folder
-   */
-  generateSetupFolder() {
-    const setupItems = [];
-
-    // Step 0 — authenticate first if an auth endpoint is detected
-    if (this.authEndpoint) {
-      setupItems.push(this.generateAuthSetupItem());
     }
 
-    // Find GET endpoints that return lists
-    const listEndpoints = this.apiSpec.endpoints.filter(
-      e => e.method === 'GET' && !e.path.includes('{')
-    );
-
-    listEndpoints.slice(0, 3).forEach((endpoint, index) => {
-      const resourceName = this.getResourceName(endpoint);
-
-      // Collect all path parameter names across all endpoints that relate to this resource
-      const relatedPathParams = new Set();
-      this.apiSpec.endpoints.forEach(ep => {
-        ep.parameters.filter(p => p.in === 'path').forEach(p => {
-          const pName = p.name.toLowerCase();
-          const rName = resourceName.toLowerCase();
-          const singular = rName.endsWith('s') ? rName.slice(0, -1) : rName;
-          if (pName.includes(singular) || pName === 'id') {
-            relatedPathParams.add(p.name);
-          }
-        });
-      });
-
-      const storeAsVars = [
-        `valid_${resourceName}_id`,
-        ...Array.from(relatedPathParams).map(p => `valid_${p}`),
-        ...Array.from(relatedPathParams)
-      ];
-      const uniqueStoreAs = [...new Set(storeAsVars)];
-
-      setupItems.push({
-        name: `Get Valid ${this.formatName(resourceName)} ID`,
-        event: [
-          {
-            listen: 'test',
-            script: {
-              exec: TestScriptGenerator.generateSetupScript(
-                this.formatName(resourceName),
-                uniqueStoreAs
-              ),
-              type: 'text/javascript'
-            }
-          }
-        ],
-        request: this.buildRequest(endpoint, {})
+    const operations = [...crud.create, ...crud.update, ...crud.delete, ...crud.read, ...crud.list]
+      .map(endpoint => ({ endpoint, tests: this.operationTests(endpoint) }))
+      .filter(entry => entry.tests.length > 0);
+    const folders = [{ name: '0. Setup', description: 'Authentication and disposable test data', item: setup }];
+    operations.forEach(({ endpoint, tests }, index) => {
+      folders.push({
+        name: `${index + 1}. ${endpoint.method} ${endpoint.path}`,
+        description: `Negative scenarios for ${endpoint.method} ${endpoint.path}`,
+        item: tests,
       });
     });
 
-    return {
-      name: '1. Setup - Get Valid IDs',
-      description: 'Setup requests to get valid IDs for negative testing',
-      item: setupItems
-    };
-  }
-
-  /**
-   * Generate negative test folders for all endpoints
-   */
-  generateNegativeFolders() {
-    const categorized = this.categorizeEndpoints();
-    let folderIndex = 2;
-
-    // POST negative tests
-    if (categorized.create.length > 0) {
-      categorized.create.forEach(endpoint => {
-        this.collection.item.push(
-          this.generateEndpointNegativeFolder(endpoint, folderIndex++)
-        );
-      });
-    }
-
-    // PUT/PATCH negative tests
-    if (categorized.update.length > 0) {
-      categorized.update.forEach(endpoint => {
-        this.collection.item.push(
-          this.generateEndpointNegativeFolder(endpoint, folderIndex++)
-        );
-      });
-    }
-
-    // DELETE negative tests
-    if (categorized.delete.length > 0) {
-      categorized.delete.forEach(endpoint => {
-        this.collection.item.push(
-          this.generateEndpointNegativeFolder(endpoint, folderIndex++)
-        );
-      });
-    }
-
-    // GET negative tests
-    if (categorized.read.length > 0) {
-      categorized.read.forEach(endpoint => {
-        this.collection.item.push(
-          this.generateEndpointNegativeFolder(endpoint, folderIndex++)
-        );
-      });
-    }
-  }
-
-  /**
-   * Generate negative test folder for a specific endpoint
-   */
-  generateEndpointNegativeFolder(endpoint, folderIndex) {
-    const resourceName = this.formatName(this.getResourceName(endpoint));
-    const negativeTests = [];
-
-    // Generate different negative scenarios based on method
-    if (endpoint.method === 'POST' || endpoint.method === 'PUT' || endpoint.method === 'PATCH') {
-      // Missing required fields
-      if (endpoint.requestBody && endpoint.requestBody.schema.properties) {
-        const requiredFields = endpoint.requestBody.schema.required || [];
-
-        requiredFields.forEach(fieldName => {
-          negativeTests.push(
-            this.createNegativeTest(
-              endpoint,
-              `[NEG] ${endpoint.method} ${resourceName} - Missing ${fieldName}`,
-              `Missing Required Field: ${fieldName}`,
-              { removedField: fieldName }
-            )
-          );
-        });
-
-        // Empty values for required fields
-        Object.keys(endpoint.requestBody.schema.properties).slice(0, 3).forEach(fieldName => {
-          negativeTests.push(
-            this.createNegativeTest(
-              endpoint,
-              `[NEG] ${endpoint.method} ${resourceName} - Empty ${fieldName}`,
-              `Empty ${fieldName}`,
-              { emptyField: fieldName }
-            )
-          );
-        });
-
-        // Invalid data types
-        Object.entries(endpoint.requestBody.schema.properties).slice(0, 2).forEach(([fieldName, schema]) => {
-          negativeTests.push(
-            this.createNegativeTest(
-              endpoint,
-              `[NEG] ${endpoint.method} ${resourceName} - Invalid ${fieldName} Type`,
-              `Invalid Type for ${fieldName}`,
-              { invalidField: fieldName, expectedType: schema.type }
-            )
-          );
-        });
-      }
-
-      // Malformed JSON (for POST/PUT/PATCH)
-      negativeTests.push(
-        this.createNegativeTest(
-          endpoint,
-          `[NEG] ${endpoint.method} ${resourceName} - Malformed JSON`,
-          'Malformed JSON Body',
-          { malformedJson: true }
-        )
-      );
-    }
-
-    // Invalid ID (for endpoints with path parameters)
-    if (endpoint.path.includes('{')) {
-      negativeTests.push(
-        this.createNegativeTest(
-          endpoint,
-          `[NEG] ${endpoint.method} ${resourceName} - Invalid ID`,
-          'Invalid ID',
-          { invalidId: true }
-        )
-      );
-
-      negativeTests.push(
-        this.createNegativeTest(
-          endpoint,
-          `[NEG] ${endpoint.method} ${resourceName} - Non-existent ID`,
-          'Non-existent ID',
-          { nonExistentId: true }
-        )
-      );
-    }
-
-    // Unauthorized access
-    negativeTests.push(
-      this.createNegativeTest(
-        endpoint,
-        `[NEG] ${endpoint.method} ${resourceName} - No Authentication`,
-        'No Authentication Token',
-        { noAuth: true }
-      )
-    );
-
-    return {
-      name: `${folderIndex}. ${resourceName} - Negative Scenarios`,
-      description: `Negative test cases for ${resourceName} ${endpoint.method} endpoint`,
-      item: negativeTests
-    };
-  }
-
-  /**
-   * Create a single negative test
-   */
-  createNegativeTest(endpoint, testName, scenario, options) {
-    return {
-      name: testName,
-      event: [
-        {
-          listen: 'test',
-          script: {
-            exec: TestScriptGenerator.generateNegativeTests(endpoint, scenario),
-            type: 'text/javascript'
-          }
-        }
-      ],
-      request: this.buildNegativeRequest(endpoint, options),
-      description: `Attempt to ${endpoint.method} with ${scenario}`
-    };
-  }
-
-  /**
-   * Build negative test request
-   */
-  buildNegativeRequest(endpoint, options) {
-    const request = {
-      method: endpoint.method,
-      header: [],
-      url: this.buildUrl(endpoint, options)
-    };
-
-    // Inject auth header unless this is a no-auth test scenario
-    if (!options.noAuth && this.authHeader) {
-      request.header.push(this.authHeader);
-    }
-
-    // Build body for POST/PUT/PATCH
-    if (['POST', 'PUT', 'PATCH'].includes(endpoint.method)) {
-      request.header.push({
-        key: 'Content-Type',
-        value: 'application/json',
-        type: 'text'
-      });
-
-      if (options.malformedJson) {
-        // Malformed JSON
-        request.body = {
-          mode: 'raw',
-          raw: '{ invalid json here }',
-          options: {
-            raw: { language: 'json' }
-          }
-        };
-      } else if (endpoint.requestBody) {
-        // Build modified body based on scenario
-        const body = this.buildNegativeBody(endpoint.requestBody.example, options);
-        request.body = {
-          mode: 'raw',
-          raw: JSON.stringify(body, null, 2),
-          options: {
-            raw: { language: 'json' }
-          }
-        };
-      }
-    }
-
-    return request;
-  }
-
-  /**
-   * Build negative test body
-   */
-  buildNegativeBody(example, options) {
-    if (!example) return {};
-
-    const body = JSON.parse(JSON.stringify(example)); // Deep clone
-
-    if (options.removedField) {
-      delete body[options.removedField];
-    } else if (options.emptyField) {
-      body[options.emptyField] = '';
-    } else if (options.invalidField) {
-      // Set invalid type
-      if (options.expectedType === 'string') {
-        body[options.invalidField] = 12345;
-      } else if (options.expectedType === 'number' || options.expectedType === 'integer') {
-        body[options.invalidField] = 'not_a_number';
-      } else if (options.expectedType === 'boolean') {
-        body[options.invalidField] = 'not_a_boolean';
-      } else if (options.expectedType === 'array') {
-        body[options.invalidField] = 'not_an_array';
-      } else if (options.expectedType === 'object') {
-        body[options.invalidField] = 'not_an_object';
-      }
-    }
-
-    return body;
-  }
-
-  /**
-   * Build URL for negative test
-   */
-  buildUrl(endpoint, options) {
-    const pathParts = endpoint.path.split('/').filter(p => p);
-    const resolvedParts = pathParts.map(part => {
-      if (part.startsWith('{') && part.endsWith('}')) {
-        const paramName = part.slice(1, -1);
-        if (options.invalidId) {
-          return 'invalid_id_format';
-        } else if (options.nonExistentId) {
-          return '00000000-0000-0000-0000-000000000000';
-        }
-        return `{{valid_${paramName}}}`;
-      }
-      return part;
-    });
-    const urlObj = {
-      raw: `{{baseUrl}}/${resolvedParts.join('/')}`,
-      host: ['{{baseUrl}}'],
-      path: resolvedParts
-    };
-
-    // Add query parameters with smart defaults
-    const queryParams = endpoint.parameters.filter(p => p.in === 'query');
-    if (queryParams.length > 0) {
-      urlObj.query = queryParams.map(param => ({
-        key: param.name,
-        value: this.getQueryParamValue(param),
-        description: param.description
+    // Teardown: delete what setup created, children first
+    const teardown = bindings
+      .filter(b => b.createOp && b.deleteOp)
+      .sort((a, b) => depth(b.deleteOp) - depth(a.deleteOp))
+      .map(b => this.positiveItem(b.deleteOp, {
+        name: `Delete disposable resource: DELETE ${b.deleteOp.path}`,
+        release: { varName: b.varName },
       }));
-    }
+    folders.push({ name: `${operations.length + 1}. Teardown`, description: 'Removes the disposable resources created in setup', item: teardown });
 
-    return urlObj;
+    return this.collection(
+      `${this.apiSpec.info.title} - Negative Test Suite`,
+      `Negative scenarios for ${this.apiSpec.info.title}: one fault per request, status codes checked against the spec.`,
+      folders,
+    );
   }
 
-  /**
-   * Build standard request
-   */
-  buildRequest(endpoint, options) {
-    const request = {
-      method: endpoint.method,
-      header: [],
-      url: this.buildUrl(endpoint, options)
-    };
+  operationTests(endpoint) {
+    const tests = [];
+    const body = endpoint.requestBody;
+    const jsonBody = body && /json/i.test(body.contentType);
 
-    if (this.authHeader) {
-      request.header.push(this.authHeader);
-    }
-
-    return request;
-  }
-
-  /**
-   * Categorize endpoints
-   */
-  categorizeEndpoints() {
-    const crud = {
-      create: [],
-      read: [],
-      update: [],
-      delete: [],
-      list: []
-    };
-
-    for (const endpoint of this.apiSpec.endpoints) {
-      // Skip auth endpoint — handled separately in setup
-      if (this.authEndpoint && endpoint.operationId === this.authEndpoint.operationId) continue;
-
-      const { method, path } = endpoint;
-
-      if (method === 'POST') {
-        crud.create.push(endpoint);
-      } else if (method === 'GET') {
-        if (path.includes('{')) {
-          crud.read.push(endpoint);
-        } else {
-          crud.list.push(endpoint);
+    if (BODY_METHODS.includes(endpoint.method) && jsonBody) {
+      const schema = flattenSchema(body.schema);
+      const example = body.example;
+      if (schemaType(schema) === 'object' && example && typeof example === 'object' && !Array.isArray(example)) {
+        for (const field of schema.required || []) {
+          const value = structuredClone(example);
+          delete value[field];
+          tests.push(this.negativeItem(endpoint, 'missingField', `missing required field "${field}"`, { body: value }));
         }
-      } else if (method === 'PUT' || method === 'PATCH') {
-        crud.update.push(endpoint);
-      } else if (method === 'DELETE') {
-        crud.delete.push(endpoint);
+        for (const [field, prop] of Object.entries(schema.properties || {}).slice(0, MAX_FIELD_TESTS)) {
+          if (prop?.readOnly) continue;
+          const wrong = wrongTypeValue(prop);
+          if (wrong === undefined) continue;
+          tests.push(this.negativeItem(endpoint, 'wrongType', `"${field}" has the wrong type (${schemaType(prop)} expected)`, {
+            body: { ...structuredClone(example), [field]: wrong },
+          }));
+        }
+        for (const [field, prop] of Object.entries(schema.properties || {}).slice(0, MAX_FIELD_TESTS)) {
+          if (prop?.readOnly || !forbidsEmptyString(prop)) continue;
+          tests.push(this.negativeItem(endpoint, 'emptyValue', `"${field}" is an empty string`, {
+            body: { ...structuredClone(example), [field]: '' },
+          }));
+        }
+      }
+      tests.push(this.negativeItem(endpoint, 'malformedJson', 'malformed JSON body', { rawBody: '{ "malformed": ' }));
+    }
+
+    const itemBinding = this.plan.itemBinding(endpoint);
+    if (itemBinding) {
+      const paramName = endpoint.path.split('/').at(-1).slice(1, -1);
+      const param = endpoint.parameters.find(p => p.in === 'path' && p.name === paramName);
+      const invalid = this.invalidIdValue(param);
+      if (invalid !== null) {
+        tests.push(this.negativeItem(endpoint, 'invalidId', `invalid "${paramName}" format (${invalid})`, {
+          pathOverrides: { [paramName]: invalid }, owned: false,
+        }));
+      }
+      const missing = this.nonExistentIdValue(param);
+      if (missing !== null) {
+        tests.push(this.negativeItem(endpoint, 'nonExistentId', `non-existent "${paramName}"`, {
+          pathOverrides: { [paramName]: missing }, owned: false,
+        }));
       }
     }
 
-    return crud;
+    if (this.auth.requiresAuth(endpoint)) {
+      tests.push(this.negativeItem(endpoint, 'noAuth', 'no credentials', { omitAuth: true }));
+    }
+    return tests;
   }
 
   /**
-   * Get resource name from endpoint
+   * @param {object} endpoint
+   * @param {string} scenario key of NEGATIVE_SCENARIOS
+   * @param {string} detail human description of the single fault
+   * @param {object} options body | rawBody | pathOverrides | omitAuth | owned
    */
-  getResourceName(endpoint) {
-    const parts = endpoint.path.split('/').filter(p => p && !p.startsWith('{'));
-    return parts[parts.length - 1] || 'resource';
+  negativeItem(endpoint, scenario, detail, options = {}) {
+    const expectation = negativeExpectation(endpoint, scenario);
+    if (expectation.specGap && !this.specGaps.some(g => g.operation === endpoint.key && g.scenario === scenario)) {
+      this.specGaps.push({ operation: endpoint.key, scenario: NEGATIVE_SCENARIOS[scenario].label, assertedCodes: expectation.codes });
+    }
+    const name = `[NEG] ${endpoint.method} ${endpoint.path} - ${detail}`;
+    return this.makeItem({
+      name,
+      description: `Expects ${codesLabel(expectation.codes)}${expectation.specGap ? ' (not documented in the spec)' : ''}.`,
+      request: buildRequest(endpoint, this.ctx, options),
+      prerequest: this.guard(endpoint, name, { owned: options.owned !== false }),
+      test: TestScriptGenerator.negativeScript(endpoint, {
+        title: name,
+        expectation,
+        contract: this.contractFor(endpoint, code => code >= 400 && code < 500),
+      }),
+      disableCookies: !!options.omitAuth,
+    });
   }
 
-  /**
-   * Format name for display
-   */
-  formatName(name) {
-    return name
-      .split(/[_-]/)
-      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ');
+  invalidIdValue(param) {
+    const schema = flattenSchema(param?.schema || {});
+    const type = schemaType(schema);
+    if (type === 'integer' || type === 'number') return 'not-a-number';
+    if (schema.format === 'uuid') return 'not-a-uuid';
+    if (schema.pattern) {
+      try { if (!new RegExp(schema.pattern).test('!invalid!')) return '!invalid!'; } catch { return null; }
+    }
+    return null; // any string is a syntactically valid id
   }
 
-  /**
-   * Get smart query parameter value
-   * Returns environment variable reference or sample data based on parameter name
-   */
-  getQueryParamValue(param) {
-    // If example exists and is not empty, use it
-    if (param.example !== undefined && param.example !== '') {
-      return String(param.example);
+  nonExistentIdValue(param) {
+    const schema = flattenSchema(param?.schema || {});
+    const type = schemaType(schema);
+    if (type === 'integer' || type === 'number') {
+      return typeof schema.maximum === 'number' ? schema.maximum : 2147483647;
     }
-
-    const paramName = param.name.toLowerCase();
-    const paramType = param.schema?.type || 'string';
-
-    // Map common parameter names to environment variables or smart defaults
-    const paramMappings = {
-      // IDs - use environment variables from setup phase
-      'id': '{{id}}',
-      'ids': '{{ids}}',
-      'area_id': '{{valid_areas}}',
-      'areas': '{{valid_areas}}',
-      'area': '{{valid_areas}}',
-      'asset_id': '{{valid_asset_ids}}',
-      'asset_ids': '{{valid_asset_ids}}',
-      'type_id': '{{valid_types_id}}',
-      'method_id': '{{valid_methods_id}}',
-      'state_id': '{{valid_states_id}}',
-      'tenant_id': '{{tenantId}}',
-
-      // Search and filter parameters
-      'search': 'test',
-      'search_string': 'test',
-      'search_term': 'search',
-      'query': 'test',
-      'q': 'test',
-      'filter': '',
-      'keyword': 'test',
-
-      // Pagination
-      'page': '1',
-      'limit': '10',
-      'offset': '0',
-      'size': '10',
-      'per_page': '10',
-      'page_size': '10',
-
-      // Sorting
-      'sort': 'id',
-      'sort_by': 'id',
-      'order': 'asc',
-      'order_by': 'id',
-
-      // Boolean flags
-      'active': 'true',
-      'enabled': 'true',
-      'deleted': 'false',
-      'is_active': 'true',
-      'include_deleted': 'false',
-
-      // Date/time
-      'date': '2024-01-15',
-      'start_date': '2024-01-01',
-      'end_date': '2024-12-31',
-      'from': '2024-01-01',
-      'to': '2024-12-31',
-      'created_at': '2024-01-15',
-      'updated_at': '2024-01-15',
-    };
-
-    // Check for exact match first
-    if (paramMappings[paramName]) {
-      return paramMappings[paramName];
-    }
-
-    // Check for partial matches (e.g., any param ending with '_id' or 'id')
-    if (paramName.endsWith('_id') || paramName.endsWith('_ids') || paramName === 'id') {
-      const resourceName = paramName.replace(/_ids?$/, '');
-      return `{{valid_${resourceName}_id}}`;
-    }
-
-    // Type-based defaults
-    if (paramType === 'integer' || paramType === 'number') {
-      return param.schema?.minimum !== undefined ? String(param.schema.minimum) : '1';
-    }
-
-    if (paramType === 'boolean') {
-      return 'true';
-    }
-
-    if (paramType === 'array') {
-      return '';
-    }
-
-    // For string types, check if it's required
-    if (param.required) {
-      // Required string parameters should have a sample value
-      if (paramName.includes('name')) return 'test';
-      if (paramName.includes('email')) return 'test@example.com';
-      if (paramName.includes('username')) return 'testuser';
-      return 'sample_value';
-    }
-
-    // Default for optional string parameters - empty string
-    return '';
+    if (schema.format === 'uuid') return NON_EXISTENT_UUID;
+    if (schema.pattern) return null;
+    return 'does-not-exist-{{$timestamp}}';
   }
 }

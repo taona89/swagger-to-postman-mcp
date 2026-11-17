@@ -1,295 +1,151 @@
 /**
  * BDD Test Case Generator
- * Generates Gherkin .feature files from OpenAPI specifications.
- * Produces both positive and negative scenarios in Given/When/Then format.
+ * Generates Gherkin .feature files from an OpenAPI spec.
+ *
+ * The scenarios are specification-level test cases (no step definitions are
+ * generated). They use the same oracles as the Postman suites, so a scenario and
+ * its Postman test always agree on the expected status code.
  */
+import { AuthContext } from '../core/auth.js';
+import {
+  successExpectation, negativeExpectation, codesLabel, resourceName, hasPathParams, BODY_METHODS,
+} from '../core/endpoints.js';
+import { flattenSchema, schemaType, generateExample, stripDynamicVariables } from '../core/schema.js';
+import { gherkinText, gherkinCell } from '../core/escape.js';
+
+const statusStep = expectation => (expectation.codes && expectation.codes.length === 1
+  ? `Then the response status code should be ${expectation.codes[0]}`
+  : `Then the response status code should be ${codesLabel(expectation.codes)}`);
 
 export class BDDGenerator {
   constructor(apiSpec) {
     this.apiSpec = apiSpec;
+    this.auth = new AuthContext(apiSpec);
   }
 
-  /**
-   * Generate all BDD feature files as a Map of filename → content.
-   */
+  /** One feature file per resource: Map of filename → content. */
   generate() {
     const features = new Map();
-
-    // Group endpoints by resource (first path segment after base)
-    const groups = this.groupByResource();
-
-    for (const [resource, endpoints] of groups) {
-      const featureName = this.formatFeatureName(resource);
-      const filename = `${this.sanitize(resource)}.feature`;
-      const content = this.generateFeature(featureName, resource, endpoints);
-      features.set(filename, content);
+    for (const [resource, endpoints] of this.groupByResource()) {
+      features.set(`${this.sanitize(resource)}.feature`, this.generateFeature(resource, endpoints));
     }
-
     return features;
   }
 
-  /**
-   * Generate a single combined feature file with all resources.
-   */
+  /** All resources in one feature file. */
   generateSingleFile() {
-    const apiName = this.apiSpec.info.title || 'API';
-    const lines = [];
-
-    lines.push(`# Auto-generated BDD test cases from OpenAPI specification`);
-    lines.push(`# API: ${apiName} v${this.apiSpec.info.version || '1.0.0'}`);
-    lines.push(`# Generated: ${new Date().toISOString()}`);
-    lines.push('');
-
-    const groups = this.groupByResource();
-
-    for (const [resource, endpoints] of groups) {
-      const featureName = this.formatFeatureName(resource);
-      lines.push(this.generateFeature(featureName, resource, endpoints));
-      lines.push('');
+    const lines = [
+      '# Auto-generated BDD test cases from OpenAPI specification',
+      `# API: ${gherkinText(this.apiSpec.info.title)} v${gherkinText(this.apiSpec.info.version)}`,
+      '# Specification-level scenarios: step definitions are not generated.',
+      '',
+    ];
+    for (const [resource, endpoints] of this.groupByResource()) {
+      lines.push(this.generateFeature(resource, endpoints), '');
     }
-
     return lines.join('\n');
   }
 
-  /**
-   * Generate a Feature block for a resource group.
-   */
-  generateFeature(featureName, resource, endpoints) {
-    const lines = [];
-    const apiName = this.apiSpec.info.title || 'API';
-
-    lines.push(`Feature: ${featureName}`);
-    lines.push(`  As an API consumer`);
-    lines.push(`  I want to interact with the ${featureName} endpoints`);
-    lines.push(`  So that I can manage ${resource} resources`);
-    lines.push('');
-
-    // Background - shared auth setup
-    lines.push(`  Background:`);
-    lines.push(`    Given I am authenticated as a valid user`);
-    lines.push(`    And the base URL is configured`);
-    lines.push('');
-
-    // Categorize endpoints
-    const categorized = this.categorize(endpoints);
-
-    // Generate scenarios for each endpoint
+  generateFeature(resource, endpoints) {
+    const featureName = this.formatFeatureName(resource);
+    const lines = [
+      `Feature: ${featureName}`,
+      '  As an API consumer',
+      `  I want to interact with the ${featureName} endpoints`,
+      `  So that I can manage ${gherkinText(resource)} resources`,
+      '',
+      '  Background:',
+      '    Given the API base URL is configured',
+      '',
+    ];
     for (const endpoint of endpoints) {
-      // Positive scenarios
-      const positiveScenarios = this.generatePositiveScenarios(endpoint);
-      for (const scenario of positiveScenarios) {
-        lines.push(scenario);
-        lines.push('');
-      }
-
-      // Negative scenarios (for writable endpoints)
-      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(endpoint.method)) {
-        const negativeScenarios = this.generateNegativeScenarios(endpoint);
-        for (const scenario of negativeScenarios) {
-          lines.push(scenario);
-          lines.push('');
-        }
+      if (this.auth.isAuthEndpoint(endpoint)) continue;
+      for (const scenario of [...this.positiveScenarios(endpoint), ...this.negativeScenarios(endpoint)]) {
+        lines.push(scenario, '');
       }
     }
-
     return lines.join('\n');
   }
 
-  /**
-   * Generate positive BDD scenarios for an endpoint.
-   */
-  generatePositiveScenarios(endpoint) {
+  positiveScenarios(endpoint) {
     const scenarios = [];
-    const action = this.describeAction(endpoint);
-    const resourceName = this.getResourceName(endpoint);
-    const expectedStatus = this.getExpectedStatus(endpoint);
-
-    // Main positive scenario
-    const lines = [];
-    lines.push(`  @positive @${endpoint.method.toLowerCase()}`);
-    lines.push(`  Scenario: Successfully ${action}`);
-
-    // Given
-    if (endpoint.parameters.filter(p => p.in === 'path').length > 0) {
-      for (const param of endpoint.parameters.filter(p => p.in === 'path')) {
-        lines.push(`    Given a valid "${param.name}" exists`);
-      }
+    const expectation = successExpectation(endpoint);
+    const path = gherkinText(endpoint.path);
+    const lines = [
+      `  @positive @${endpoint.method.toLowerCase()}`,
+      `  Scenario: Successfully ${this.describeAction(endpoint)} (${endpoint.method} ${path})`,
+    ];
+    if (this.auth.sendsAuth(endpoint)) lines.push('    Given I am authenticated');
+    for (const param of endpoint.parameters.filter(p => p.in === 'path')) {
+      lines.push(`    And a "${gherkinText(param.name)}" of a resource created by this test exists`);
     }
 
-    // When
-    if (endpoint.requestBody) {
-      lines.push(`    When I send a ${endpoint.method} request to "${endpoint.path}" with a valid request body`);
-      const required = this.getRequiredFields(endpoint);
-      if (required.length > 0) {
-        lines.push(`    And the request body contains:`);
-        for (const field of required) {
-          lines.push(`      | ${field.name} | ${field.type} | ${field.example} |`);
-        }
+    const fields = this.bodyFields(endpoint);
+    if (fields.length > 0) {
+      lines.push(`    When I send a ${endpoint.method} request to "${path}" with the body:`);
+      lines.push('      | field | type | required | example |');
+      for (const field of fields) {
+        lines.push(`      | ${gherkinCell(field.name)} | ${gherkinCell(field.type)} | ${field.required ? 'yes' : 'no'} | ${gherkinCell(field.example)} |`);
       }
     } else {
-      const queryParams = endpoint.parameters.filter(p => p.in === 'query');
-      if (queryParams.length > 0) {
-        lines.push(`    When I send a ${endpoint.method} request to "${endpoint.path}" with parameters:`);
-        for (const param of queryParams) {
-          lines.push(`      | ${param.name} | ${this.exampleValue(param)} |`);
+      const query = endpoint.parameters.filter(p => p.in === 'query' && p.required);
+      if (query.length > 0) {
+        lines.push(`    When I send a ${endpoint.method} request to "${path}" with the query parameters:`);
+        lines.push('      | parameter | value |');
+        for (const param of query) {
+          lines.push(`      | ${gherkinCell(param.name)} | ${gherkinCell(this.example(param.schema, param.name, param.example))} |`);
         }
       } else {
-        lines.push(`    When I send a ${endpoint.method} request to "${endpoint.path}"`);
+        lines.push(`    When I send a ${endpoint.method} request to "${path}"`);
       }
     }
+    lines.push(`    ${statusStep(expectation)}`);
 
-    // Then
-    lines.push(`    Then the response status code should be ${expectedStatus}`);
-
-    if (expectedStatus === 204) {
-      lines.push(`    And the response body should be empty`);
-    } else if (endpoint.method === 'GET') {
-      const responseSchema = this.getResponseSchema(endpoint, expectedStatus);
-      if (responseSchema?.type === 'array') {
-        lines.push(`    And the response should be a JSON array`);
-        if (responseSchema.items?.properties) {
-          const fields = Object.keys(responseSchema.items.properties).slice(0, 5);
-          lines.push(`    And each item should contain the fields: ${fields.join(', ')}`);
-        }
-      } else if (responseSchema?.properties) {
-        const fields = Object.keys(responseSchema.properties).slice(0, 5);
-        lines.push(`    And the response should be a JSON object`);
-        lines.push(`    And the response should contain the fields: ${fields.join(', ')}`);
-      } else {
-        lines.push(`    And the response should be valid JSON`);
-      }
-    } else if (endpoint.method === 'POST') {
-      lines.push(`    And the response should contain the created resource`);
-    } else if (['PUT', 'PATCH'].includes(endpoint.method)) {
-      lines.push(`    And the response should contain the updated resource`);
-    }
-
-    lines.push(`    And the response time should be less than 5000ms`);
-
+    const documented = this.successResponse(endpoint);
+    if (documented?.schema) lines.push('    And the response body should match the schema documented for that status code');
+    else if (expectation.codes?.includes(204)) lines.push('    And a 204 response should have an empty body');
+    lines.push('    And the response time should be below the configured threshold');
     scenarios.push(lines.join('\n'));
-
-    // Contract validation scenario for GET endpoints
-    if (endpoint.method === 'GET') {
-      const contractLines = [];
-      contractLines.push(`  @contract @${endpoint.method.toLowerCase()}`);
-      contractLines.push(`  Scenario: Validate response contract for ${endpoint.path}`);
-
-      if (endpoint.parameters.filter(p => p.in === 'path').length > 0) {
-        for (const param of endpoint.parameters.filter(p => p.in === 'path')) {
-          contractLines.push(`    Given a valid "${param.name}" exists`);
-        }
-      }
-
-      contractLines.push(`    When I send a ${endpoint.method} request to "${endpoint.path}"`);
-      contractLines.push(`    Then the response status code should be ${expectedStatus}`);
-      contractLines.push(`    And the Content-Type header should include "application/json"`);
-      contractLines.push(`    And the response should match the schema defined in the specification`);
-
-      scenarios.push(contractLines.join('\n'));
-    }
-
     return scenarios;
   }
 
-  /**
-   * Generate negative BDD scenarios for an endpoint.
-   */
-  generateNegativeScenarios(endpoint) {
+  negativeScenarios(endpoint) {
     const scenarios = [];
-    const resourceName = this.getResourceName(endpoint);
+    const path = gherkinText(endpoint.path);
+    const add = (scenario, title, given, when) => {
+      const expectation = negativeExpectation(endpoint, scenario);
+      const lines = [`  @negative @${endpoint.method.toLowerCase()}${expectation.specGap ? ' @spec-gap' : ''}`, `  Scenario: ${title}`];
+      if (scenario !== 'noAuth' && this.auth.sendsAuth(endpoint)) lines.push('    Given I am authenticated');
+      lines.push(...given.map(step => `    ${step}`), `    When ${when}`, `    ${statusStep(expectation)}`);
+      scenarios.push(lines.join('\n'));
+    };
 
-    // 1. No authentication
-    scenarios.push(this.buildNegativeScenario(
-      endpoint,
-      `Reject ${endpoint.method} ${endpoint.path} without authentication`,
-      ['Given I am not authenticated'],
-      `I send a ${endpoint.method} request to "${endpoint.path}"`,
-      401,
-      'the response should indicate authentication is required'
-    ));
-
-    // 2. Malformed JSON (for endpoints with body)
-    if (endpoint.requestBody) {
-      scenarios.push(this.buildNegativeScenario(
-        endpoint,
-        `Reject ${endpoint.method} ${endpoint.path} with malformed JSON`,
-        [],
-        `I send a ${endpoint.method} request to "${endpoint.path}" with malformed JSON body`,
-        422,
-        'the response should indicate invalid request format'
-      ));
-
-      // 3. Missing required fields
-      const required = this.getRequiredFields(endpoint);
-      for (const field of required.slice(0, 3)) {
-        scenarios.push(this.buildNegativeScenario(
-          endpoint,
-          `Reject ${endpoint.method} ${endpoint.path} without required field "${field.name}"`,
-          [],
-          `I send a ${endpoint.method} request to "${endpoint.path}" without the "${field.name}" field`,
-          422,
-          `the response should indicate "${field.name}" is required`
-        ));
+    if (BODY_METHODS.includes(endpoint.method) && endpoint.requestBody && /json/i.test(endpoint.requestBody.contentType)) {
+      const fields = this.bodyFields(endpoint);
+      for (const field of fields.filter(f => f.required)) {
+        add('missingField', `Reject ${endpoint.method} ${path} without required field "${gherkinText(field.name)}"`, [],
+          `I send a ${endpoint.method} request to "${path}" with a valid body without the "${gherkinText(field.name)}" field`);
       }
-
-      // 4. Invalid data types
-      for (const field of required.slice(0, 2)) {
-        const invalidType = field.type === 'string' ? 'integer' : 'string';
-        scenarios.push(this.buildNegativeScenario(
-          endpoint,
-          `Reject ${endpoint.method} ${endpoint.path} with invalid type for "${field.name}"`,
-          [],
-          `I send a ${endpoint.method} request to "${endpoint.path}" with "${field.name}" as a ${invalidType} instead of ${field.type}`,
-          422,
-          `the response should indicate invalid type for "${field.name}"`
-        ));
+      for (const field of fields.filter(f => f.type !== 'any')) {
+        add('wrongType', `Reject ${endpoint.method} ${path} when "${gherkinText(field.name)}" is not a ${field.type}`, [],
+          `I send a ${endpoint.method} request to "${path}" with a valid body where "${gherkinText(field.name)}" has the wrong type`);
       }
+      add('malformedJson', `Reject ${endpoint.method} ${path} with a malformed JSON body`, [],
+        `I send a ${endpoint.method} request to "${path}" with a malformed JSON body`);
     }
 
-    // 5. Invalid ID (for endpoints with path params)
-    const pathParams = endpoint.parameters.filter(p => p.in === 'path');
-    if (pathParams.length > 0) {
-      scenarios.push(this.buildNegativeScenario(
-        endpoint,
-        `Reject ${endpoint.method} ${endpoint.path} with invalid ID format`,
-        [`Given the path parameter "${pathParams[0].name}" is set to "invalid_id_format"`],
-        `I send a ${endpoint.method} request to "${endpoint.path}"`,
-        400,
-        'the response should indicate invalid ID format'
-      ));
-
-      // 6. Non-existent resource
-      scenarios.push(this.buildNegativeScenario(
-        endpoint,
-        `Reject ${endpoint.method} ${endpoint.path} for non-existent resource`,
-        [`Given the path parameter "${pathParams[0].name}" is set to "00000000-0000-0000-0000-000000000000"`],
-        `I send a ${endpoint.method} request to "${endpoint.path}"`,
-        404,
-        'the response should indicate the resource was not found'
-      ));
+    if (hasPathParams(endpoint)) {
+      const last = endpoint.parameters.filter(p => p.in === 'path').at(-1);
+      add('nonExistentId', `Reject ${endpoint.method} ${path} for a non-existent "${gherkinText(last.name)}"`,
+        [`Given "${gherkinText(last.name)}" refers to a resource that does not exist`],
+        `I send a ${endpoint.method} request to "${path}"`);
     }
 
+    if (this.auth.requiresAuth(endpoint)) {
+      add('noAuth', `Reject ${endpoint.method} ${path} without credentials`, ['Given I am not authenticated'],
+        `I send a ${endpoint.method} request to "${path}"`);
+    }
     return scenarios;
-  }
-
-  /**
-   * Build a single negative scenario in Gherkin format.
-   */
-  buildNegativeScenario(endpoint, title, givenSteps, whenStep, expectedStatus, thenDetail) {
-    const lines = [];
-    lines.push(`  @negative @${endpoint.method.toLowerCase()}`);
-    lines.push(`  Scenario: ${title}`);
-
-    for (const step of givenSteps) {
-      lines.push(`    ${step}`);
-    }
-
-    lines.push(`    When ${whenStep}`);
-    lines.push(`    Then the response status code should be ${expectedStatus}`);
-    lines.push(`    And ${thenDetail}`);
-    lines.push(`    And the response should not return a 5xx server error`);
-
-    return lines.join('\n');
   }
 
   // ── Helpers ──────────────────────────────────────────────
@@ -297,121 +153,58 @@ export class BDDGenerator {
   groupByResource() {
     const groups = new Map();
     for (const endpoint of this.apiSpec.endpoints) {
-      const parts = endpoint.path.split('/').filter(p => p && !p.startsWith('{'));
-      // Use the last non-param segment as the resource name
-      const resource = parts[parts.length - 1] || 'root';
-      if (!groups.has(resource)) {
-        groups.set(resource, []);
-      }
+      if (this.auth.isAuthEndpoint(endpoint)) continue; // exercised as a step, not a feature
+      const resource = resourceName(endpoint);
+      if (!groups.has(resource)) groups.set(resource, []);
       groups.get(resource).push(endpoint);
     }
     return groups;
   }
 
-  categorize(endpoints) {
-    return {
-      list: endpoints.filter(e => e.method === 'GET' && !e.parameters.some(p => p.in === 'path')),
-      read: endpoints.filter(e => e.method === 'GET' && e.parameters.some(p => p.in === 'path')),
-      create: endpoints.filter(e => e.method === 'POST'),
-      update: endpoints.filter(e => ['PUT', 'PATCH'].includes(e.method)),
-      delete: endpoints.filter(e => e.method === 'DELETE'),
-    };
-  }
-
   describeAction(endpoint) {
-    const resource = this.getResourceName(endpoint);
-    const hasPathParam = endpoint.parameters.some(p => p.in === 'path');
-
+    const resource = resourceName(endpoint).replace(/_/g, ' ');
+    const item = hasPathParams(endpoint);
     switch (endpoint.method) {
-      case 'GET':
-        return hasPathParam ? `retrieve a specific ${resource}` : `list all ${resource}`;
-      case 'POST':
-        return `create a new ${resource}`;
+      case 'GET': return item ? `retrieve a ${resource}` : `list ${resource}`;
+      case 'POST': return `create a ${resource}`;
       case 'PUT':
-      case 'PATCH':
-        return `update an existing ${resource}`;
-      case 'DELETE':
-        return `delete a ${resource}`;
-      default:
-        return `perform ${endpoint.method} on ${resource}`;
+      case 'PATCH': return `update a ${resource}`;
+      case 'DELETE': return `delete a ${resource}`;
+      default: return `${endpoint.method} ${resource}`;
     }
   }
 
-  getResourceName(endpoint) {
-    const parts = endpoint.path.split('/').filter(p => p && !p.startsWith('{'));
-    const last = parts[parts.length - 1] || 'resource';
-    return last.replace(/_/g, ' ');
+  successResponse(endpoint) {
+    const code = Object.keys(endpoint.responses || {}).find(c => /^2\d\d$/.test(c));
+    return code ? endpoint.responses[code] : null;
   }
 
-  getExpectedStatus(endpoint) {
-    if (endpoint.responses) {
-      const codes = Object.keys(endpoint.responses)
-        .filter(c => c >= 200 && c < 300)
-        .map(Number)
-        .sort((a, b) => a - b);
-      if (codes.length > 0) return codes[0];
-    }
-    if (endpoint.method === 'POST') return 201;
-    if (endpoint.method === 'DELETE') return 204;
-    return 200;
-  }
-
-  getResponseSchema(endpoint, statusCode) {
-    const resp = endpoint.responses?.[String(statusCode)] || endpoint.responses?.['200'];
-    return resp?.schema || null;
-  }
-
-  getRequiredFields(endpoint) {
-    if (!endpoint.requestBody?.schema?.properties) return [];
-
-    const required = new Set(endpoint.requestBody.schema.required || []);
-    const props = endpoint.requestBody.schema.properties;
-    const fields = [];
-
-    for (const [name, schema] of Object.entries(props)) {
-      fields.push({
+  bodyFields(endpoint) {
+    if (!endpoint.requestBody) return [];
+    const schema = flattenSchema(endpoint.requestBody.schema);
+    const required = new Set(schema.required || []);
+    return Object.entries(schema.properties || {})
+      .filter(([, prop]) => !prop?.readOnly)
+      .map(([name, prop]) => ({
         name,
-        type: schema.type || 'string',
+        type: schemaType(prop) || 'any',
         required: required.has(name),
-        example: this.schemaExample(schema, name),
-      });
-    }
-
-    // Required fields first, then optional
-    return fields.sort((a, b) => (b.required ? 1 : 0) - (a.required ? 1 : 0));
+        example: this.example(prop, name),
+      }))
+      .sort((a, b) => Number(b.required) - Number(a.required));
   }
 
-  schemaExample(schema, name) {
-    if (schema.example !== undefined) return String(schema.example);
-    if (schema.enum?.length > 0) return schema.enum[0];
-    if (schema.format === 'uuid') return '<valid-uuid>';
-    if (schema.format === 'date') return '2024-01-15';
-    if (schema.format === 'date-time') return '2024-01-15T10:00:00Z';
-
-    const lower = (name || '').toLowerCase();
-    if (lower.includes('email')) return 'test@example.com';
-    if (lower.includes('name')) return 'Test Name';
-    if (lower.endsWith('_id') || lower === 'id') return '<valid-uuid>';
-
-    switch (schema.type) {
-      case 'integer': case 'number': return '1';
-      case 'boolean': return 'true';
-      case 'array': return '[]';
-      default: return '<valid-value>';
-    }
-  }
-
-  exampleValue(param) {
-    return this.schemaExample(param.schema || {}, param.name);
+  example(schema, name, explicit) {
+    const value = explicit !== undefined ? explicit : generateExample(schema, { propName: name, unique: false });
+    const clean = stripDynamicVariables(value);
+    return typeof clean === 'object' && clean !== null ? JSON.stringify(clean) : String(clean ?? '');
   }
 
   formatFeatureName(resource) {
-    return resource
-      .replace(/_/g, ' ')
-      .replace(/\b\w/g, c => c.toUpperCase());
+    return gherkinText(resource).replace(/[_-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   }
 
   sanitize(name) {
-    return name.replace(/[^a-z0-9_-]/gi, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    return String(name).replace(/[^a-z0-9_-]/gi, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'root';
   }
 }

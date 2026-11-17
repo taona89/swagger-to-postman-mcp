@@ -2,6 +2,9 @@
  * Technical Specification Generator
  * Generates comprehensive technical documentation from OpenAPI specifications
  */
+import { mdCell } from '../core/escape.js';
+import { flattenSchema, schemaType, stripDynamicVariables } from '../core/schema.js';
+
 export class TechSpecGenerator {
   constructor(apiSpec) {
     this.apiSpec = apiSpec;
@@ -44,9 +47,8 @@ export class TechSpecGenerator {
 |----------|-------|
 | API Name | ${title} |
 | Version | ${version} |
-| Base URL | ${this.apiSpec.baseUrl} |
-| Protocol | HTTPS |
-| Format | JSON |
+| Base URL | ${mdCell(this.apiSpec.baseUrl || '(not set)')} |
+| Spec Format | ${this.apiSpec.specVersion} |
 | Generated | ${date} |`;
   }
 
@@ -108,36 +110,30 @@ This API does not require authentication.`;
 
 ${this.apiSpec.authSchemes.map(scheme => {
   if (scheme.type === 'apiKey') {
-    return `#### API Key Authentication
+    const example = scheme.in === 'header'
+      ? `${scheme.paramName}: <api-key>`
+      : scheme.in === 'cookie' ? `Cookie: ${scheme.paramName}=<api-key>` : `?${scheme.paramName}=<api-key>`;
+    return `#### ${scheme.key} (API key)
 
-- **Type:** API Key
 - **Location:** ${scheme.in}
-- **Parameter Name:** ${scheme.name}
+- **Parameter Name:** \`${scheme.paramName}\`
 
 **Example:**
 \`\`\`
-${scheme.in === 'header' ? `${scheme.name}: your-api-key-here` : `?${scheme.name}=your-api-key-here`}
+${example}
 \`\`\``;
   } else if (scheme.type === 'http') {
-    return `#### HTTP Authentication
+    return `#### ${scheme.key} (HTTP ${scheme.scheme || 'auth'})
 
-- **Type:** ${scheme.scheme || 'Basic'}
-- **Location:** Authorization Header
+- **Location:** Authorization header
 
 **Example:**
 \`\`\`
-Authorization: Bearer your-token-here
+Authorization: ${scheme.scheme === 'basic' ? 'Basic <base64 username:password>' : 'Bearer <token>'}
 \`\`\``;
   }
-  return `#### ${scheme.type} Authentication\n\nSee API documentation for details.`;
-}).join('\n\n')}
-
-### Authentication Flow
-
-1. Obtain credentials from the authentication endpoint
-2. Include credentials in subsequent requests
-3. Credentials are validated on each request
-4. Invalid credentials return 401 Unauthorized`;
+  return `#### ${scheme.key} (${scheme.type})\n\nSee the API documentation for details.`;
+}).join('\n\n')}`;
   }
 
   /**
@@ -166,7 +162,7 @@ ${Object.entries(groupedEndpoints).map(([tag, endpoints]) =>
     return `| Method | Endpoint | Description |
 |--------|----------|-------------|
 ${this.apiSpec.endpoints.map(e =>
-  `| ${e.method.padEnd(6)} | \`${e.path}\` | ${e.summary || 'No description'} |`
+  `| ${e.method.padEnd(6)} | \`${mdCell(e.path)}\` | ${mdCell(e.summary || 'No description')} |`
 ).join('\n')}`;
   }
 
@@ -218,7 +214,7 @@ ${pathParams.length > 0 ? `**Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 ${pathParams.map(p =>
-  `| ${p.name} | ${p.schema?.type || 'string'} | ${p.required ? 'Yes' : 'No'} | ${p.description || '-'} |`
+  `| ${mdCell(p.name)} | ${mdCell(schemaType(p.schema) || 'string')} | ${p.required ? 'Yes' : 'No'} | ${mdCell(p.description)} |`
 ).join('\n')}
 ` : ''}
 
@@ -227,14 +223,14 @@ ${queryParams.length > 0 ? `**Query Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 ${queryParams.map(p =>
-  `| ${p.name} | ${p.schema?.type || 'string'} | ${p.required ? 'Yes' : 'No'} | ${p.description || '-'} |`
+  `| ${mdCell(p.name)} | ${mdCell(schemaType(p.schema) || 'string')} | ${p.required ? 'Yes' : 'No'} | ${mdCell(p.description)} |`
 ).join('\n')}
 ` : ''}
 
-${hasBody ? `**Request Body:**
+${hasBody ? `**Request Body** (\`${endpoint.requestBody.contentType}\`):
 
 \`\`\`json
-${JSON.stringify(endpoint.requestBody.example, null, 2)}
+${JSON.stringify(stripDynamicVariables(endpoint.requestBody.example), null, 2)}
 \`\`\`
 
 **Schema:**
@@ -248,9 +244,9 @@ ${this.generateResponsesTable(endpoint.responses)}
 **Example Request:**
 
 \`\`\`bash
-curl -X ${endpoint.method} "${this.apiSpec.baseUrl}${endpoint.path}" \\
-  -H "Content-Type: application/json"${hasBody ? ` \\
-  -d '${JSON.stringify(endpoint.requestBody.example)}'` : ''}
+curl -X ${endpoint.method} "${this.apiSpec.baseUrl}${endpoint.path}"${hasBody ? ` \\
+  -H "Content-Type: ${endpoint.requestBody.contentType}" \\
+  -d '${JSON.stringify(stripDynamicVariables(endpoint.requestBody.example)).replace(/'/g, "'\\''")}'` : ''}
 \`\`\``;
   }
 
@@ -258,14 +254,15 @@ curl -X ${endpoint.method} "${this.apiSpec.baseUrl}${endpoint.path}" \\
    * Format schema properties
    */
   formatSchema(schema) {
-    if (!schema || !schema.properties) {
+    const flat = flattenSchema(schema);
+    if (!flat.properties) {
       return '- See API specification for schema details';
     }
 
-    return Object.entries(schema.properties)
+    return Object.entries(flat.properties)
       .map(([name, prop]) => {
-        const required = schema.required?.includes(name) ? '(required)' : '(optional)';
-        return `- **${name}** ${required}: ${prop.type} - ${prop.description || 'No description'}`;
+        const required = flat.required?.includes(name) ? '(required)' : '(optional)';
+        return `- **${name}** ${required}: ${schemaType(prop) || 'any'} - ${(prop?.description || 'No description').replace(/\r?\n/g, ' ')}`;
       })
       .join('\n');
   }
@@ -277,7 +274,7 @@ curl -X ${endpoint.method} "${this.apiSpec.baseUrl}${endpoint.path}" \\
     return `| Status Code | Description |
 |-------------|-------------|
 ${Object.entries(responses).map(([code, response]) =>
-  `| ${code} | ${response.description || 'No description'} |`
+  `| ${mdCell(code)} | ${mdCell(response.description || 'No description')} |`
 ).join('\n')}`;
   }
 
@@ -313,7 +310,7 @@ ${schema.properties ? `**Properties:**
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
 ${Object.entries(schema.properties).map(([propName, prop]) =>
-  `| ${propName} | ${prop.type || 'any'} | ${schema.required?.includes(propName) ? 'Yes' : 'No'} | ${prop.description || '-'} |`
+  `| ${mdCell(propName)} | ${mdCell(schemaType(prop) || 'any')} | ${schema.required?.includes(propName) ? 'Yes' : 'No'} | ${mdCell(prop?.description)} |`
 ).join('\n')}` : ''}
 
 **Example:**
@@ -359,42 +356,21 @@ ${JSON.stringify(this.generateSchemaExample(schema), null, 2)}
    * Generate error handling section
    */
   generateErrorHandling() {
+    const rows = [];
+    for (const endpoint of this.apiSpec.endpoints) {
+      for (const [code, response] of Object.entries(endpoint.responses || {})) {
+        if (/^[45]\d\d$/.test(code)) {
+          rows.push(`| ${mdCell(`${endpoint.method} ${endpoint.path}`)} | ${code} | ${mdCell(response.description)} |`);
+        }
+      }
+    }
     return `## Error Handling
 
-### Standard Error Response
+Error responses documented in the specification:
 
-All errors follow a consistent format:
-
-\`\`\`json
-{
-  "error": "Error message",
-  "message": "Detailed error description",
-  "statusCode": 400,
-  "timestamp": "2024-01-15T10:00:00Z"
-}
-\`\`\`
-
-### HTTP Status Codes
-
-| Code | Description | Meaning |
-|------|-------------|---------|
-| 200 | OK | Request succeeded |
-| 201 | Created | Resource created successfully |
-| 204 | No Content | Request succeeded, no content returned |
-| 400 | Bad Request | Invalid request parameters |
-| 401 | Unauthorized | Authentication required or failed |
-| 403 | Forbidden | Insufficient permissions |
-| 404 | Not Found | Resource not found |
-| 422 | Unprocessable Entity | Validation error |
-| 500 | Internal Server Error | Server error occurred |
-
-### Error Handling Best Practices
-
-1. Always check the HTTP status code
-2. Parse the error response body for details
-3. Implement retry logic for 5xx errors
-4. Log errors for debugging
-5. Display user-friendly error messages`;
+${rows.length > 0 ? `| Operation | Status | Description |
+|-----------|--------|-------------|
+${rows.join('\n')}` : '_The specification documents no 4xx/5xx responses._'}`;
   }
 
   /**

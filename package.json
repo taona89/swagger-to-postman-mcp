@@ -1,7 +1,7 @@
 {
   "name": "swagger-to-postman-mcp",
-  "version": "1.0.0",
-  "description": "MCP Server that generates Postman collections (positive and negative tests) from OpenAPI/Swagger specifications",
+  "version": "2.0.0",
+  "description": "MCP server and CLI that generate Postman test suites (positive, negative, contract, data-driven) from OpenAPI 3.x and Swagger 2.0 specs",
   "main": "index.js",
   "type": "module",
   "bin": {
@@ -9,8 +9,10 @@
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
-    "test": "node test-generator.js"
+    "generate": "node generate.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "lint": "eslint .",
+    "check": "npm run lint && npm test"
   },
   "keywords": [
     "mcp",
@@ -25,16 +27,28 @@
   "author": "API Test Team",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@apidevtools/swagger-parser": "^10.1.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "js-yaml": "^4.1.0",
-    "swagger-parser": "^10.0.3",
-    "uuid": "^9.0.1"
+    "randexp": "^0.5.3",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^16.5.0",
     "newman": "^6.2.2",
     "newman-reporter-htmlextra": "^1.23.1"
   },
   "engines": {
-    "node": ">=18.0.0"
-  }
+    "node": ">=22"
+  },
+  "files": [
+    "index.js",
+    "generate.js",
+    "src/",
+    "swagger/",
+    "README.md",
+    "LICENSE"
+  ]
 }

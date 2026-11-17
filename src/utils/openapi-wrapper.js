@@ -1,208 +1,77 @@
 /**
  * OpenAPI Wrapper Utility
- * Wraps partial OpenAPI specs (paths only) into complete OpenAPI documents
+ * Wraps partial OpenAPI specs (e.g. a pasted `paths` section saved as .txt) into
+ * a complete document. Everything happens in memory: the wrapper never writes
+ * files, so read-only operations stay read-only.
  */
-import fs from 'fs/promises';
-import path from 'path';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import yaml from 'js-yaml';
 
 export class OpenAPIWrapper {
   /**
-   * Wraps a partial OpenAPI spec into a complete document
-   * @param {string} filePath - Path to the partial spec file (.txt)
-   * @returns {Object} Complete OpenAPI specification
+   * Parse a partial spec file and return a complete OpenAPI 3 document.
+   * @param {string} filePath path to the partial spec (.txt)
+   * @returns {Promise<object>}
    */
   static async wrapPartialSpec(filePath) {
-    console.log(`📝 Reading partial OpenAPI spec: ${filePath}`);
+    const content = await fs.readFile(filePath, 'utf8');
+    const partialSpec = this.parseContent(content);
 
-    let content = await fs.readFile(filePath, 'utf8');
-    let partialSpec;
-
-    // Try to parse as JSON first (more common for partial specs)
-    try {
-      // Try parsing as JSON
-      partialSpec = JSON.parse(content);
-      console.log('✅ Parsed as JSON');
-    } catch (jsonError) {
-      // If JSON fails, try wrapping it in braces if it looks like object properties
-      if (content.trim().startsWith('"') || content.trim().startsWith('/')) {
-        try {
-          // Remove trailing comma if exists
-          let cleanContent = content.trim();
-          if (cleanContent.endsWith(',')) {
-            cleanContent = cleanContent.slice(0, -1);
-            console.log('🔧 Removed trailing comma');
-          }
-
-          const wrappedContent = `{${cleanContent}}`;
-          partialSpec = JSON.parse(wrappedContent);
-          console.log('✅ Parsed as wrapped JSON object');
-        } catch (wrapError) {
-          // Try YAML as last resort
-          try {
-            partialSpec = yaml.load(content);
-            console.log('✅ Parsed as YAML');
-          } catch (yamlError) {
-            throw new Error(`Failed to parse spec file. JSON error: ${jsonError.message}, Wrap error: ${wrapError.message}, YAML error: ${yamlError.message}`);
-          }
-        }
-      } else {
-        // Try YAML directly
-        try {
-          partialSpec = yaml.load(content);
-          console.log('✅ Parsed as YAML');
-        } catch (yamlError) {
-          throw new Error(`Failed to parse spec file. JSON error: ${jsonError.message}, YAML error: ${yamlError.message}`);
-        }
-      }
+    if (!partialSpec || typeof partialSpec !== 'object' || Array.isArray(partialSpec)) {
+      throw new Error('Partial spec must be a JSON or YAML object');
     }
+    if (partialSpec.openapi || partialSpec.swagger) return partialSpec;
 
-    // Extract API name from filename
-    const fileName = path.basename(filePath, path.extname(filePath));
-    const apiName = fileName
-      .replace(/_openai|_swagger|_spec/gi, '')
+    const apiName = path.basename(filePath, path.extname(filePath))
+      .replace(/_(swagger|spec|openapi)$/i, '')
       .split(/[_-]/)
+      .filter(Boolean)
       .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ');
+      .join(' ') || 'Partial';
 
-    // Create complete OpenAPI wrapper
     const completeSpec = {
-      openapi: '3.0.0',
-      info: {
-        title: `${apiName} API`,
-        version: '1.0.0',
-        description: `API for ${apiName}`
-      },
-      servers: [
-        {
-          url: 'https://api.example.com',
-          description: 'Production server'
-        }
-      ],
-      security: [
-        {
-          cookieAuth: []
-        }
-      ],
-      paths: {},
-      components: {
-        securitySchemes: {
-          cookieAuth: {
-            type: 'apiKey',
-            in: 'cookie',
-            name: 'session_token'
-          }
-        },
-        schemas: {}
-      }
+      openapi: '3.0.3',
+      info: { title: `${apiName} API`, version: '1.0.0', description: `Wrapped from partial spec ${path.basename(filePath)}` },
+      paths: partialSpec.paths || partialSpec,
+      components: { schemas: {}, ...(partialSpec.components || {}) },
     };
-
-    // If partialSpec is already complete, return it
-    if (partialSpec.openapi || partialSpec.swagger) {
-      console.log('✅ Spec is already complete OpenAPI format');
-      return partialSpec;
-    }
-
-    // If it has paths, merge them
-    if (partialSpec.paths) {
-      completeSpec.paths = partialSpec.paths;
-    } else if (typeof partialSpec === 'object' && !Array.isArray(partialSpec)) {
-      // Assume the entire object is the paths section
-      completeSpec.paths = partialSpec;
-    }
-
-    // Merge components if they exist
-    if (partialSpec.components) {
-      completeSpec.components = {
-        ...completeSpec.components,
-        ...partialSpec.components,
-        securitySchemes: {
-          ...completeSpec.components.securitySchemes,
-          ...(partialSpec.components.securitySchemes || {})
-        }
-      };
-    }
-
-    // Extract and add schemas from responses
-    this.extractSchemas(completeSpec);
-
-    console.log(`✅ Wrapped partial spec into complete OpenAPI document`);
-    console.log(`   Endpoints found: ${Object.keys(completeSpec.paths).length}`);
-
+    completeSpec.components.schemas = completeSpec.components.schemas || {};
+    this.addPlaceholderSchemas(completeSpec);
     return completeSpec;
   }
 
-  /**
-   * Extract schema references and add placeholder schemas
-   * @param {Object} spec - OpenAPI specification
-   */
-  static extractSchemas(spec) {
-    const schemaRefs = new Set();
+  static parseContent(content) {
+    const trimmed = content.trim();
+    try { return JSON.parse(trimmed); } catch { /* try other forms */ }
+    // A bare list of "path": {...} entries, optionally with a trailing comma
+    if (trimmed.startsWith('"')) {
+      try { return JSON.parse(`{${trimmed.replace(/,\s*$/, '')}}`); } catch { /* try YAML */ }
+    }
+    try {
+      return yaml.load(content);
+    } catch (error) {
+      throw new Error(`Failed to parse partial spec as JSON or YAML: ${error.message}`);
+    }
+  }
 
-    // Find all $ref references
-    // Use a circular-safe traversal to avoid stack overflow
+  /** Add permissive placeholder schemas for #/components/schemas refs that are not defined. */
+  static addPlaceholderSchemas(spec) {
+    const refs = new Set();
     const seen = new WeakSet();
-
-    const traverse = (obj) => {
-      if (!obj || typeof obj !== 'object') return;
-      if (seen.has(obj)) return; // Skip circular references
-      seen.add(obj);
-
-      if (obj.$ref && typeof obj.$ref === 'string' && obj.$ref.startsWith('#/components/schemas/')) {
-        const schemaName = obj.$ref.split('/').pop();
-        schemaRefs.add(schemaName);
+    const walk = node => {
+      if (!node || typeof node !== 'object' || seen.has(node)) return;
+      seen.add(node);
+      if (typeof node.$ref === 'string' && node.$ref.startsWith('#/components/schemas/')) {
+        refs.add(node.$ref.slice('#/components/schemas/'.length));
       }
-
-      for (const key in obj) {
-        if (obj.hasOwnProperty(key)) {
-          traverse(obj[key]);
-        }
-      }
+      for (const value of Object.values(node)) walk(value);
     };
-
-    traverse(spec);
-
-    // Add placeholder schemas for all references
-    schemaRefs.forEach(schemaName => {
-      if (!spec.components.schemas[schemaName]) {
-        spec.components.schemas[schemaName] = {
-          type: 'object',
-          properties: {
-            id: { type: 'string' },
-            name: { type: 'string' }
-          }
-        };
+    walk(spec.paths);
+    for (const name of refs) {
+      if (!spec.components.schemas[name]) {
+        spec.components.schemas[name] = { type: 'object', description: 'Placeholder: schema not present in partial spec' };
       }
-    });
-  }
-
-  /**
-   * Save wrapped spec to YAML file
-   * @param {Object} spec - OpenAPI specification
-   * @param {string} outputPath - Output file path
-   */
-  static async saveAsYAML(spec, outputPath) {
-    const yamlContent = yaml.dump(spec, {
-      indent: 2,
-      lineWidth: 120,
-      noRefs: true
-    });
-
-    await fs.writeFile(outputPath, yamlContent, 'utf8');
-    console.log(`✅ Saved complete OpenAPI spec to: ${outputPath}`);
-  }
-
-  /**
-   * Process .txt file: wrap and save as .yaml
-   * @param {string} txtFilePath - Path to .txt file
-   * @returns {string} Path to generated .yaml file
-   */
-  static async processTxtFile(txtFilePath) {
-    const spec = await this.wrapPartialSpec(txtFilePath);
-
-    const outputPath = txtFilePath.replace(/\.txt$/i, '.yaml');
-    await this.saveAsYAML(spec, outputPath);
-
-    return outputPath;
+    }
   }
 }

@@ -1,13 +1,31 @@
 /**
  * HTML Report Generator
- * Generates comprehensive HTML reports for test collections
+ * Static summary of a generated suite. Every value that originates from the
+ * spec or the collections is HTML-escaped (spec content is untrusted input).
  */
+import { escapeHtml } from '../core/escape.js';
+
+const esc = escapeHtml;
+const countRequests = collection => {
+  let n = 0;
+  const walk = items => (items || []).forEach(item => (item.item ? walk(item.item) : n++));
+  walk(collection.item);
+  return n;
+};
+
 export class HTMLReportGenerator {
   /**
-   * Generate HTML report from API spec and collections
+   * @param {object} apiSpec parsed spec
+   * @param {object} positiveCollection
+   * @param {object} negativeCollection
+   * @param {object} [extras] { coverage, specGaps }
    */
-  static generate(apiSpec, positiveCollection, negativeCollection) {
-    const timestamp = new Date().toLocaleString();
+  static generate(apiSpec, positiveCollection, negativeCollection, extras = {}) {
+    const timestamp = new Date().toISOString();
+    const coverage = extras.coverage;
+    const specGaps = extras.specGaps || [];
+    const contractCount = [positiveCollection, negativeCollection]
+      .flatMap(c => JSON.stringify(c).match(/to\.have\.jsonSchema/g) || []).length;
 
     return `
 <!DOCTYPE html>
@@ -15,7 +33,8 @@ export class HTMLReportGenerator {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${apiSpec.info.title} - Test Collection Report</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+    <title>${esc(apiSpec.info.title)} - Test Collection Report</title>
     <style>
         * {
             margin: 0;
@@ -519,9 +538,9 @@ export class HTMLReportGenerator {
 <body>
     <div class="container">
         <div class="header">
-            <h1>📊 ${apiSpec.info.title}</h1>
-            <div class="version">Version ${apiSpec.info.version}</div>
-            <div class="timestamp">Generated: ${timestamp}</div>
+            <h1>📊 ${esc(apiSpec.info.title)}</h1>
+            <div class="version">Version ${esc(apiSpec.info.version)}</div>
+            <div class="timestamp">Generated: ${esc(timestamp)}</div>
         </div>
 
         <div class="summary">
@@ -532,18 +551,18 @@ export class HTMLReportGenerator {
             </div>
             <div class="summary-card positive">
                 <h3>Positive Tests</h3>
-                <div class="value">${positiveCollection.item.length}</div>
-                <div class="subtitle">Test Folders</div>
+                <div class="value">${countRequests(positiveCollection)}</div>
+                <div class="subtitle">Requests</div>
             </div>
             <div class="summary-card negative">
                 <h3>Negative Tests</h3>
-                <div class="value">${negativeCollection.item.length}</div>
-                <div class="subtitle">Test Scenarios</div>
+                <div class="value">${countRequests(negativeCollection)}</div>
+                <div class="subtitle">Requests</div>
             </div>
             <div class="summary-card">
-                <h3>Coverage</h3>
-                <div class="value">100%</div>
-                <div class="subtitle">Comprehensive</div>
+                <h3>Operation Coverage</h3>
+                <div class="value">${coverage ? `${coverage.positivePercent}%` : 'n/a'}</div>
+                <div class="subtitle">${coverage ? `negative: ${coverage.negativePercent}% of writable operations` : 'not computed'}</div>
             </div>
         </div>
 
@@ -557,15 +576,15 @@ export class HTMLReportGenerator {
                     <div class="api-info-grid">
                         <div class="api-info-item">
                             <strong>Title:</strong>
-                            <span>${apiSpec.info.title}</span>
+                            <span>${esc(apiSpec.info.title)}</span>
                         </div>
                         <div class="api-info-item">
                             <strong>Version:</strong>
-                            <span>${apiSpec.info.version}</span>
+                            <span>${esc(apiSpec.info.version)}</span>
                         </div>
                         <div class="api-info-item">
                             <strong>Base URL:</strong>
-                            <span>${apiSpec.baseUrl}</span>
+                            <span>${esc(apiSpec.baseUrl || '(not set in spec)')}</span>
                         </div>
                         <div class="api-info-item">
                             <strong>Total Endpoints:</strong>
@@ -575,7 +594,7 @@ export class HTMLReportGenerator {
                     ${apiSpec.info.description ? `
                     <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #e0e0e0;">
                         <strong style="color: #667eea;">Description:</strong>
-                        <p style="color: #555; margin-top: 8px;">${apiSpec.info.description}</p>
+                        <p style="color: #555; margin-top: 8px;">${esc(apiSpec.info.description)}</p>
                     </div>
                     ` : ''}
                 </div>
@@ -585,7 +604,7 @@ export class HTMLReportGenerator {
                     <h4>🔐 Authentication</h4>
                     <ul>
                         ${apiSpec.authSchemes.map(auth => `
-                            <li>${auth.name} (${auth.type}${auth.scheme ? ': ' + auth.scheme : ''})</li>
+                            <li>${esc(auth.key)} (${esc(auth.type)}${auth.scheme ? ': ' + esc(auth.scheme) : ''}${auth.paramName ? ` - ${esc(auth.in)} "${esc(auth.paramName)}"` : ''})</li>
                         `).join('')}
                     </ul>
                 </div>
@@ -610,10 +629,10 @@ export class HTMLReportGenerator {
                     <tbody>
                         ${apiSpec.endpoints.map(endpoint => `
                             <tr>
-                                <td><span class="method-badge method-${endpoint.method}">${endpoint.method}</span></td>
-                                <td><code>${endpoint.path}</code></td>
-                                <td>${endpoint.summary || 'No description'}</td>
-                                <td>${endpoint.tags.join(', ') || '-'}</td>
+                                <td><span class="method-badge method-${esc(endpoint.method)}">${esc(endpoint.method)}</span></td>
+                                <td><code>${esc(endpoint.path)}</code></td>
+                                <td>${esc(endpoint.summary || 'No description')}</td>
+                                <td>${esc(endpoint.tags.join(', ') || '-')}</td>
                             </tr>
                         `).join('')}
                     </tbody>
@@ -633,7 +652,7 @@ export class HTMLReportGenerator {
                 ${positiveCollection.item.map(folder => `
                     <div class="collection-folder">
                         <div class="folder-header">
-                            <span class="folder-name">${folder.name}</span>
+                            <span class="folder-name">${esc(folder.name)}</span>
                             <span class="folder-count">${folder.item ? folder.item.length : 0} tests</span>
                         </div>
                         ${folder.item && folder.item.length > 0 ? `
@@ -649,12 +668,12 @@ export class HTMLReportGenerator {
             <div class="section">
                 <div class="section-header">
                     <h2>❌ Negative Test Collection</h2>
-                    <span class="badge">${negativeCollection.item.length} scenarios</span>
+                    <span class="badge">${negativeCollection.item.length} folders</span>
                 </div>
                 ${negativeCollection.item.map(folder => `
                     <div class="collection-folder">
                         <div class="folder-header">
-                            <span class="folder-name">${folder.name}</span>
+                            <span class="folder-name">${esc(folder.name)}</span>
                             <span class="folder-count" style="background: #ef4444;">${folder.item ? folder.item.length : 0} tests</span>
                         </div>
                         ${folder.item && folder.item.length > 0 ? `
@@ -675,23 +694,35 @@ export class HTMLReportGenerator {
                     <h3 style="color: #667eea; margin-bottom: 15px;">Generated Test Types</h3>
                     <ul style="list-style: none; padding: 0;">
                         <li style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
-                            ✅ <strong>Positive Tests:</strong> CRUD operations, contract validation, performance checks
+                            ✅ <strong>Positive Tests:</strong> documented success codes, CRUD chaining on resources created by the run
                         </li>
                         <li style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
-                            ❌ <strong>Negative Tests:</strong> Missing fields, invalid types, malformed data, unauthorized access
+                            ❌ <strong>Negative Tests:</strong> one fault per request (missing/wrong-type/empty fields, malformed JSON, invalid and unknown ids, missing credentials)
                         </li>
                         <li style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
-                            📋 <strong>Contract Testing:</strong> Schema validation for all responses
-                        </li>
-                        <li style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
-                            🔐 <strong>Authentication:</strong> Token extraction and session management
+                            📋 <strong>Contract Testing:</strong> ${contractCount} schema check${contractCount === 1 ? '' : 's'} against documented response schemas
                         </li>
                         <li style="padding: 10px 0;">
-                            ⚡ <strong>Performance:</strong> Response time assertions
+                            ⚡ <strong>Performance:</strong> response time below <code>responseTimeThresholdMs</code>
                         </li>
                     </ul>
                 </div>
             </div>
+
+            ${specGaps.length > 0 ? `
+            <div class="section">
+                <div class="section-header">
+                    <h2>🕳️ Spec Gaps</h2>
+                    <span class="badge">${specGaps.length}</span>
+                </div>
+                <div class="api-info">
+                    <p style="margin-bottom: 10px;">These scenarios have no documented status code; tests assert the HTTP-conventional codes instead.</p>
+                    <ul style="padding-left: 20px;">
+                        ${specGaps.map(g => `<li><code>${esc(g.operation)}</code> - ${esc(g.scenario)} (asserting ${esc(g.assertedCodes.join('/'))})</li>`).join('')}
+                    </ul>
+                </div>
+            </div>
+            ` : ''}
         </div>
 
         <div class="footer">
@@ -700,11 +731,6 @@ export class HTMLReportGenerator {
                 <p style="margin-top: 10px; color: #a0aec0;">
                     Import these collections into Postman or run with Newman for comprehensive API testing
                 </p>
-            </div>
-            <div class="footer-links">
-                <a href="#" class="footer-link">Documentation</a>
-                <a href="#" class="footer-link">Support</a>
-                <a href="#" class="footer-link">GitHub</a>
             </div>
         </div>
     </div>
@@ -721,19 +747,11 @@ export class HTMLReportGenerator {
     endpoints.forEach(e => {
       methodCount[e.method] = (methodCount[e.method] || 0) + 1;
     });
-
-    const colors = {
-      GET: '#10b981',
-      POST: '#3b82f6',
-      PUT: '#f59e0b',
-      PATCH: '#8b5cf6',
-      DELETE: '#ef4444'
-    };
-
+    const colors = { GET: '#10b981', POST: '#3b82f6', PUT: '#f59e0b', PATCH: '#8b5cf6', DELETE: '#ef4444' };
     return Object.entries(methodCount)
       .map(([method, count]) => `
         <div class="stat-box" style="border-left-color: ${colors[method] || '#667eea'}">
-          <div class="stat-label">${method}</div>
+          <div class="stat-label">${esc(method)}</div>
           <div class="stat-value">${count}</div>
         </div>
       `)
@@ -741,119 +759,90 @@ export class HTMLReportGenerator {
   }
 
   /**
-   * Generate detailed test item with request, response, and test information
+   * Request, expected status and assertions for one collection item
    */
   static generateTestItemDetails(item) {
     const request = item.request;
     if (!request) return '';
 
-    // Extract URL
-    const url = typeof request.url === 'string'
-      ? request.url
-      : (request.url?.raw || request.url?.host?.join('.') + request.url?.path?.join('/') || '');
-
-    // Extract query parameters
+    const url = typeof request.url === 'string' ? request.url : (request.url?.raw || '');
     const queryParams = (typeof request.url === 'object' && request.url?.query) || [];
-
-    // Extract headers
     const headers = request.header || [];
 
-    // Extract body
     let bodyContent = '';
-    if (request.body) {
-      if (request.body.mode === 'raw') {
-        try {
-          bodyContent = request.body.raw;
-          // Try to pretty print JSON
-          if (bodyContent && bodyContent.trim().startsWith('{')) {
-            bodyContent = JSON.stringify(JSON.parse(bodyContent), null, 2);
-          }
-        } catch (e) {
-          bodyContent = request.body.raw || '';
-        }
-      } else if (request.body.mode === 'formdata') {
-        bodyContent = 'Form Data: ' + (request.body.formdata || []).map(f => `${f.key}=${f.value}`).join(', ');
-      }
+    if (request.body?.mode === 'raw') {
+      bodyContent = request.body.raw || '';
+      try {
+        if (bodyContent.trim().startsWith('{')) bodyContent = JSON.stringify(JSON.parse(bodyContent), null, 2);
+      } catch { /* show as-is */ }
+    } else if (request.body?.mode === 'urlencoded' || request.body?.mode === 'formdata') {
+      bodyContent = (request.body[request.body.mode] || []).map(f => `${f.key}=${f.value}`).join('\n');
     }
 
-    // Extract test scripts/assertions
-    const testScripts = item.event?.find(e => e.listen === 'test')?.script?.exec || [];
-    const assertions = this.extractAssertions(testScripts);
+    const testScript = item.event?.find(e => e.listen === 'test')?.script?.exec || [];
+    const assertions = this.extractAssertions(testScript);
+    const expected = this.getExpectedStatus(testScript);
 
     return `
       <div class="folder-item">
         <div class="item-header">
-          <span class="item-name">${item.name}</span>
-          <span class="item-type">${request.method || 'REQUEST'}</span>
+          <span class="item-name">${esc(item.name)}</span>
+          <span class="item-type">${esc(request.method || 'REQUEST')}</span>
         </div>
         <div class="test-details">
           ${url ? `
             <div class="test-section">
               <div class="test-label">Request URL</div>
-              <div class="test-content">
-                <div class="test-url">${this.escapeHtml(url)}</div>
-              </div>
+              <div class="test-content"><div class="test-url">${esc(url)}</div></div>
             </div>
           ` : ''}
-
           ${headers.length > 0 ? `
             <div class="test-section">
               <div class="test-label">Headers</div>
               <div class="test-content">
                 ${headers.map(h => `
                   <div class="header-item">
-                    <span class="header-key">${this.escapeHtml(h.key)}:</span>
-                    <span class="header-value">${this.escapeHtml(h.value || '')}</span>
+                    <span class="header-key">${esc(h.key)}:</span>
+                    <span class="header-value">${esc(h.value || '')}${h.disabled ? ' (disabled)' : ''}</span>
                   </div>
                 `).join('')}
               </div>
             </div>
           ` : ''}
-
           ${queryParams.length > 0 ? `
             <div class="test-section">
               <div class="test-label">Query Parameters</div>
               <div class="test-content">
                 ${queryParams.map(q => `
                   <div class="header-item">
-                    <span class="header-key">${this.escapeHtml(q.key)}:</span>
-                    <span class="header-value">${this.escapeHtml(q.value || '(empty)')}</span>
+                    <span class="header-key">${esc(q.key)}:</span>
+                    <span class="header-value">${esc(q.value || '(empty)')}${q.disabled ? ' (disabled)' : ''}</span>
                   </div>
                 `).join('')}
               </div>
             </div>
           ` : ''}
-
           ${bodyContent ? `
             <div class="test-section">
               <div class="test-label">Request Body</div>
-              <div class="test-content">
-                <div class="test-body">${this.escapeHtml(bodyContent)}</div>
-              </div>
+              <div class="test-content"><div class="test-body">${esc(bodyContent)}</div></div>
             </div>
           ` : ''}
-
           <div class="test-section">
             <div class="test-label">Expected Response</div>
             <div class="test-content">
               <div class="header-item">
                 <span class="header-key">Status Code:</span>
-                <span class="header-value">${this.getExpectedStatus(item, request.method)}</span>
+                <span class="header-value">${esc(expected)}</span>
               </div>
-              <div class="header-item">
-                <span class="header-key">Content-Type:</span>
-                <span class="header-value">application/json</span>
-              </div>
-              ${this.getExpectedResponseBody(item, request.method)}
             </div>
           </div>
-
           ${assertions.length > 0 ? `
             <div class="test-section">
               <div class="test-label">Test Assertions</div>
               <div class="test-content">
                 <ul class="test-assertions">
-                  ${assertions.map(a => `<li>${this.escapeHtml(a)}</li>`).join('')}
+                  ${assertions.map(a => `<li>${esc(a)}</li>`).join('')}
                 </ul>
               </div>
             </div>
@@ -863,138 +852,25 @@ export class HTMLReportGenerator {
     `;
   }
 
-  /**
-   * Get expected status code for request
-   */
-  static getExpectedStatus(item, method) {
-    // Check if it's a negative test
-    if (item.name && item.name.includes('[NEG]')) {
-      return '400-404 (Error Response)';
-    }
-
-    // Positive test expected statuses
-    const statusMap = {
-      'GET': '200 OK',
-      'POST': '201 Created / 200 OK',
-      'PUT': '200 OK',
-      'PATCH': '200 OK',
-      'DELETE': '204 No Content / 200 OK'
-    };
-
-    return statusMap[method] || '200 OK';
+  /** Expected status recorded by the script generator ("// expected-status: ..."). */
+  static getExpectedStatus(testScript) {
+    const marker = (Array.isArray(testScript) ? testScript : [String(testScript)])
+      .find(line => line.startsWith('// expected-status:'));
+    return marker ? marker.slice('// expected-status:'.length).trim() : 'not asserted';
   }
 
-  /**
-   * Get expected response body description
-   */
-  static getExpectedResponseBody(item, method) {
-    const isNegative = item.name && item.name.includes('[NEG]');
-
-    if (isNegative) {
-      return `
-        <div style="margin-top: 8px;">
-          <strong>Error Response:</strong>
-          <div class="test-body" style="margin-top: 4px;">
-{
-  "error": "Error message",
-  "message": "Detailed description",
-  "statusCode": 400
-}</div>
-        </div>
-      `;
-    }
-
-    // Positive test response
-    if (method === 'DELETE') {
-      return '<div style="margin-top: 8px;"><strong>Response:</strong> Empty body (204 No Content) or success message</div>';
-    }
-
-    if (method === 'POST') {
-      return `
-        <div style="margin-top: 8px;">
-          <strong>Success Response:</strong>
-          <div class="test-body" style="margin-top: 4px;">
-{
-  "id": "created-resource-id",
-  ...other fields
-}</div>
-        </div>
-      `;
-    }
-
-    return `
-      <div style="margin-top: 8px;">
-        <strong>Success Response:</strong>
-        <div class="test-body" style="margin-top: 4px;">
-{
-  ...resource data or array
-}</div>
-      </div>
-    `;
-  }
-
-  /**
-   * Extract human-readable assertions from test script
-   */
-  static extractAssertions(testScripts) {
-    if (!Array.isArray(testScripts)) return [];
-
+  /** Human-readable assertion titles (pm.test names are JSON string literals). */
+  static extractAssertions(testScript) {
+    const scriptText = Array.isArray(testScript) ? testScript.join('\n') : String(testScript || '');
     const assertions = [];
-    const scriptText = testScripts.join('\n');
-
-    // Common patterns to extract
-    const patterns = [
-      { regex: /pm\.test\(["']([^"']+)["']/g, type: 'test' },
-      { regex: /pm\.expect\(.*?\)\.to\.([a-zA-Z]+)/g, type: 'expect' },
-      { regex: /pm\.response\.to\.have\.status\((\d+)\)/g, format: (m) => `Response status should be ${m[1]}` },
-      { regex: /pm\.response\.to\.be\.(\w+)/g, format: (m) => `Response should be ${m[1]}` },
-      { regex: /responseTime\s*<\s*(\d+)/g, format: (m) => `Response time should be less than ${m[1]}ms` },
-    ];
-
-    // Extract pm.test() assertions
-    let match;
-    const testRegex = /pm\.test\(["']([^"']+)["']/g;
-    while ((match = testRegex.exec(scriptText)) !== null) {
-      assertions.push(match[1]);
+    for (const match of scriptText.matchAll(/pm\.test\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g)) {
+      try {
+        assertions.push(match[1].startsWith('"') ? JSON.parse(match[1]) : match[1].slice(1, -1));
+      } catch {
+        assertions.push(match[1]);
+      }
     }
-
-    // Extract status code checks
-    const statusRegex = /pm\.response\.to\.have\.status\((\d+)\)/g;
-    while ((match = statusRegex.exec(scriptText)) !== null) {
-      assertions.push(`Response status should be ${match[1]}`);
-    }
-
-    // Extract response time checks
-    const timeRegex = /responseTime\s*<\s*(\d+)/g;
-    while ((match = timeRegex.exec(scriptText)) !== null) {
-      assertions.push(`Response time should be less than ${match[1]}ms`);
-    }
-
-    // Check for schema validation
-    if (scriptText.includes('tv4.validate')) {
-      assertions.push('Response schema validation');
-    }
-
-    // Check for variable setting
-    if (scriptText.includes('pm.environment.set') || scriptText.includes('pm.collectionVariables.set')) {
-      assertions.push('Save response data to variables');
-    }
-
-    return assertions.length > 0 ? assertions : ['Status and response validation'];
-  }
-
-  /**
-   * Escape HTML special characters
-   */
-  static escapeHtml(text) {
-    if (!text) return '';
-    const map = {
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#039;'
-    };
-    return text.toString().replace(/[&<>"']/g, m => map[m]);
+    if (/pm\.collectionVariables\.set|pm\.environment\.set/.test(scriptText)) assertions.push('Stores response data for later requests');
+    return assertions;
   }
 }

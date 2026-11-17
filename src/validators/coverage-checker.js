@@ -1,105 +1,92 @@
 /**
- * Checks that all endpoints in the OpenAPI spec are covered by
- * generated positive and/or negative test collections.
+ * Maps every request in the collections back to a spec operation by matching
+ * path templates (a "{param}" segment matches any value, so "{{booking_id}}"
+ * and "not-a-number" both match "/booking/{id}") and reports operation coverage.
  */
+import { pathSegments, WRITE_METHODS } from '../core/endpoints.js';
+import { AuthContext } from '../core/auth.js';
 
 export class CoverageChecker {
   /**
-   * @param {object} apiSpec - Parsed API spec with endpoints[]
-   * @param {object} positiveCollection - Postman positive collection JSON
-   * @param {object} negativeCollection - Postman negative collection JSON
-   * @returns {{ total, positiveCovered, negativeCovered, uncoveredPositive, uncoveredNegative, positivePercent, negativePercent }}
+   * @returns {{ total, writableTotal, positiveCovered, negativeCovered, uncoveredPositive, uncoveredNegative, positivePercent, negativePercent, excluded }}
    */
   check(apiSpec, positiveCollection, negativeCollection) {
-    // Build set of spec endpoints: "GET /api/resource"
-    const specEndpoints = apiSpec.endpoints.map(e => ({
-      key: `${e.method} ${e.path}`,
-      method: e.method,
-      path: e.path,
-    }));
+    const operations = apiSpec.endpoints.map(e => ({ key: e.key, method: e.method, segments: pathSegments(e.path) }));
+    const positive = this.coveredOperations(operations, positiveCollection);
+    const negative = this.coveredOperations(operations, negativeCollection);
 
-    // Extract endpoints from collections
-    const positiveEndpoints = this.extractEndpoints(positiveCollection);
-    const negativeEndpoints = this.extractEndpoints(negativeCollection);
+    const auth = new AuthContext(apiSpec);
+    const excluded = auth.authEndpoint ? [`${auth.authEndpoint.key} (authentication endpoint; exercised in setup)`] : [];
+    const writable = operations.filter(op => WRITE_METHODS.includes(op.method) && op.key !== auth.authEndpoint?.key);
 
-    // Check positive coverage
-    const coveredPositive = [];
-    const uncoveredPositive = [];
-    for (const ep of specEndpoints) {
-      if (positiveEndpoints.has(ep.key)) {
-        coveredPositive.push(ep.key);
-      } else {
-        uncoveredPositive.push(ep.key);
-      }
-    }
-
-    // For negative tests, only writable endpoints (POST, PUT, PATCH, DELETE) are expected
-    const writableEndpoints = specEndpoints.filter(ep =>
-      ['POST', 'PUT', 'PATCH', 'DELETE'].includes(ep.method)
-    );
-    const coveredNegative = [];
-    const uncoveredNegative = [];
-    for (const ep of writableEndpoints) {
-      if (negativeEndpoints.has(ep.key)) {
-        coveredNegative.push(ep.key);
-      } else {
-        uncoveredNegative.push(ep.key);
-      }
-    }
-
-    const positivePercent = specEndpoints.length > 0
-      ? Math.round((coveredPositive.length / specEndpoints.length) * 100)
-      : 100;
-    const negativePercent = writableEndpoints.length > 0
-      ? Math.round((coveredNegative.length / writableEndpoints.length) * 100)
-      : 100;
+    const uncoveredPositive = operations.filter(op => !positive.has(op.key)).map(op => op.key).sort();
+    const uncoveredNegative = writable.filter(op => !negative.has(op.key)).map(op => op.key).sort();
+    const percent = (covered, total) => (total === 0 ? 100 : Math.round((covered / total) * 100));
 
     return {
-      total: specEndpoints.length,
-      writableTotal: writableEndpoints.length,
-      positiveCovered: coveredPositive.length,
-      negativeCovered: coveredNegative.length,
-      uncoveredPositive: uncoveredPositive.sort(),
-      uncoveredNegative: uncoveredNegative.sort(),
-      positivePercent,
-      negativePercent,
+      total: operations.length,
+      writableTotal: writable.length,
+      positiveCovered: operations.length - uncoveredPositive.length,
+      negativeCovered: writable.length - uncoveredNegative.length,
+      uncoveredPositive,
+      uncoveredNegative,
+      positivePercent: percent(operations.length - uncoveredPositive.length, operations.length),
+      negativePercent: percent(writable.length - uncoveredNegative.length, writable.length),
+      excluded,
     };
   }
 
-  /**
-   * Recursively extract "METHOD /path" keys from a Postman collection.
-   */
-  extractEndpoints(collection) {
-    const endpoints = new Set();
+  coveredOperations(operations, collection) {
+    const covered = new Set();
+    for (const request of this.requests(collection)) {
+      const match = this.match(operations, request.method, request.segments);
+      if (match) covered.add(match.key);
+    }
+    return covered;
+  }
 
-    const walk = (items) => {
-      if (!items) return;
-      for (const item of items) {
-        if (item.item) {
-          // Folder — recurse
-          walk(item.item);
-        } else if (item.request) {
-          const method = typeof item.request.method === 'string'
-            ? item.request.method.toUpperCase()
-            : '';
-          const rawUrl = typeof item.request.url === 'string'
-            ? item.request.url
-            : item.request.url?.raw || '';
-
-          // Extract path from URL: remove {{baseUrl}} prefix, normalize {{param}} to {param}
-          const path = rawUrl
-            .replace(/\{\{baseUrl\}\}/g, '')
-            .replace(/\{\{([^}]+)\}\}/g, '{$1}')
-            .split('?')[0]; // remove query string
-
-          if (method && path) {
-            endpoints.add(`${method} ${path}`);
-          }
+  /** Most specific operation (most literal segment matches) for a request. */
+  match(operations, method, segments) {
+    let best = null;
+    let bestScore = -1;
+    for (const op of operations) {
+      if (op.method !== method || op.segments.length !== segments.length) continue;
+      let score = 0;
+      let ok = true;
+      op.segments.forEach((segment, i) => {
+        if (!ok) return;
+        if (segment.includes('{')) {
+          const pattern = new RegExp(`^${segment.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\\?\{[^}]+\\?\}/g, '.+')}$`);
+          ok = pattern.test(segments[i]) || /^\{\{.+\}\}$/.test(segments[i]);
+        } else {
+          ok = segment === segments[i];
+          score += 1;
         }
+      });
+      if (ok && score > bestScore) { best = op; bestScore = score; }
+    }
+    return best;
+  }
+
+  requests(collection) {
+    const found = [];
+    const walk = items => {
+      for (const item of items || []) {
+        if (item.item) { walk(item.item); continue; }
+        if (!item.request) continue;
+        const method = String(item.request.method || 'GET').toUpperCase();
+        const url = item.request.url;
+        let segments;
+        if (url && typeof url === 'object' && Array.isArray(url.path)) {
+          segments = url.path.map(String).filter(Boolean);
+        } else {
+          const raw = typeof url === 'string' ? url : url?.raw || '';
+          segments = raw.replace(/^\{\{baseUrl\}\}/, '').replace(/^[a-z]+:\/\/[^/]+/i, '').split('?')[0].split('/').filter(Boolean);
+        }
+        found.push({ method, segments });
       }
     };
-
-    walk(collection.item);
-    return endpoints;
+    walk(collection?.item);
+    return found;
   }
 }
