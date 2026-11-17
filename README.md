@@ -60,8 +60,8 @@ response contract broken, auth not enforced, ...).
   `[SKIPPED]` log line and listed as warnings at generation time. Set the
   collection variable `allowMutationOfExistingData=true` to opt out.
 - The guard uses `pm.execution.skipRequest()` (Newman 6.1+, current Postman app).
-  On older runners it fails closed by redirecting the request to an unroutable
-  host.
+  On older runners it fails closed: headers, auth and body are stripped and the
+  request is sent to the loopback discard port instead of the API.
 - The first request of each run clears captured ids, so stale ids from an earlier
   run are never reused.
 - Optional query parameters are included but disabled, so they never filter results
@@ -206,6 +206,10 @@ CI runs lint and tests on Ubuntu, Windows and macOS with Node 22 and 24.
   them (generation warns otherwise).
 - Non-JSON, non-form request bodies (XML, plain text) are sent as the spec's
   example text, without field-level negative tests.
+- POST "actions" on a collection path without a parameter (e.g.
+  `POST /orders/bulk-delete`, `POST /admin/reset`) look like creates and are not
+  guarded. Review such operations before running the positive suite against
+  shared data.
 - Path parameters whose collection has no create or list endpoint are read from
   the environment; update/delete on those resources are skipped unless
   `allowMutationOfExistingData=true`.

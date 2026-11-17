@@ -11,7 +11,7 @@ import { PositiveTestGenerator } from '../src/generators/positive-generator.js';
 import { NegativeTestGenerator } from '../src/generators/negative-generator.js';
 import { TestScriptGenerator } from '../src/generators/test-script-generator.js';
 import { js } from '../src/core/escape.js';
-import { toJsonSchema } from '../src/core/schema.js';
+import { toJsonSchema, generateExample } from '../src/core/schema.js';
 import { kitchenSpec, startKitchenMock } from './fixtures/kitchen.js';
 import { tempDir, writeJson, runNewman, requestItems, scriptOf } from './helpers.js';
 
@@ -127,14 +127,43 @@ test('readOnly required fields get no missing-field test; spec gaps are not dupl
 test('guard fails closed on runners without pm.execution.skipRequest', () => {
   const script = TestScriptGenerator.guardScript({ label: 'x', ownedVars: ['orders_id'] }).join('\n');
   const updates = [];
+  const calls = [];
   const store = values => ({ get: k => values[k] });
   const pm = {
     variables: store({ orders_id: '1' }),
     collectionVariables: store({}),
-    request: { url: { update: u => updates.push(u) } },
+    request: {
+      url: { update: u => updates.push(u) },
+      headers: { clear: () => calls.push('headers') },
+      authorizeUsing: mode => calls.push(`auth:${mode}`),
+      body: { update: b => calls.push(`body:${b.raw}`) },
+    },
   };
   new Function('pm', 'console', script)(pm, { warn() {} });
-  assert.deepEqual(updates, ['http://request-skipped.invalid/']);
+  assert.deepEqual(updates, ['http://127.0.0.1:9/request-skipped']);
+  assert.deepEqual(calls, ['headers', 'auth:noauth', 'body:'], 'credentials and body are stripped');
+});
+
+test('fail-closed fallback sends nothing to the API in a real Newman run', async () => {
+  const { startMock } = await import('./fixtures/restful-booker-mock.js');
+  const guard = TestScriptGenerator.guardScript({ label: 'x', ownedVars: ['booking_id'] })
+    .map(line => line.replace(/pm\.execution\.skipRequest/g, 'pm.execution.skipRequestMissing'));
+  const collection = {
+    info: { name: 'fallback', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+    item: [{
+      name: 'guarded delete',
+      event: [{ listen: 'prerequest', script: { exec: guard } }],
+      request: { method: 'DELETE', header: [{ key: 'Cookie', value: 'token=abc123token' }], url: '{{baseUrl}}/booking/1' },
+    }],
+  };
+  const mock = await startMock();
+  try {
+    await runNewman(collection, { values: [{ key: 'booking_id', value: '1' }] }, mock.url);
+    assert.deepEqual(mock.requests, [], 'the API received no request');
+    assert.ok(mock.bookings.has(1));
+  } finally {
+    await mock.close();
+  }
 });
 
 test('guard skips when an environment value shadows the captured id', () => {
@@ -200,9 +229,13 @@ test('js() keeps "__proto__" keys as own properties', () => {
   assert.equal(Object.getPrototypeOf(roundTrip), Object.prototype);
 });
 
-test('contract schemas stay small for mutually referencing schemas', () => {
-  const schemas = Array.from({ length: 8 }, (_, i) => ({ type: 'object', properties: { name: { type: 'string', title: `S${i}` } } }));
+test('contract schemas and request examples stay small for mutually referencing schemas', () => {
+  const schemas = Array.from({ length: 10 }, (_, i) => ({ type: 'object', properties: { name: { type: 'string', title: `S${i}` } } }));
   for (const s of schemas) for (const [i, other] of schemas.entries()) s.properties[`link${i}`] = other;
   const out = JSON.stringify(toJsonSchema(schemas[0]));
   assert.ok(out.length < 20000, `schema is ${out.length} bytes`);
+  const started = Date.now();
+  const example = JSON.stringify(generateExample(schemas[0]));
+  assert.ok(example.length < 50000, `example is ${example.length} bytes`);
+  assert.ok(Date.now() - started < 1000, 'example generation is fast');
 });

@@ -329,8 +329,12 @@ function numberExample(schema, type) {
  * @param {boolean} [options.unique] allow {{$timestamp}} suffixes for unique-per-run strings
  */
 export function generateExample(schema, options = {}, depth = 0, stack = []) {
-  const { propName = '', mode = 'request', unique = true } = options;
+  // A node budget shared by the whole example keeps mutually referencing schemas
+  // from producing exponentially large bodies.
+  if (depth === 0) options = { ...options, budget: { left: 500 } };
+  const { propName = '', mode = 'request', unique = true, budget } = options;
   if (!isObject(schema) || schema.$ref || depth > 8 || stack.includes(schema)) return null;
+  if (budget && budget.left-- <= 0) return null;
   const next = [...stack, schema];
   const s = flattenSchema(schema);
 
