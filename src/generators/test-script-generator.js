@@ -76,28 +76,46 @@ export class TestScriptGenerator {
   /**
    * Skip a request when its prerequisites are missing:
    *  - requiredVars: path variables that must resolve
-   *  - ownedVars: resources this request mutates; they must have been created by this run
+   *  - ownedVars: resources this request mutates; they must have been created by
+   *    this run, and the value actually used ({{name}}) must be the captured one
+   *    (an environment or data value of the same name would take precedence)
+   *  - needsOptIn: the request modifies data no run can own (collection-level
+   *    update/delete, values from the environment); runs only with
+   *    allowMutationOfExistingData=true
+   * Fails closed: on runners without pm.execution.skipRequest the request is
+   * redirected to an unroutable host instead of being sent.
    */
-  static guardScript({ label, requiredVars = [], ownedVars = [] }) {
-    if (requiredVars.length === 0 && ownedVars.length === 0) return [];
+  static guardScript({ label, requiredVars = [], ownedVars = [], needsOptIn = false }) {
+    if (requiredVars.length === 0 && ownedVars.length === 0 && !needsOptIn) return [];
     return [
       '(function () {',
       `    const required = ${js(requiredVars)};`,
       `    const owned = ${js(ownedVars)};`,
+      `    const needsOptIn = ${js(needsOptIn)};`,
       '    const missing = required.filter(function (name) {',
       '        const value = pm.variables.get(name);',
       '        return value === undefined || value === null || value === "";',
       '    });',
-      '    // Opt-in escape hatch: set allowMutationOfExistingData=true to update/delete records this run did not create',
+      '    // Opt-in escape hatch: allowMutationOfExistingData=true lets requests modify records this run did not create',
       '    const allowExisting = String(pm.variables.get("allowMutationOfExistingData")) === "true";',
       '    const notOwned = allowExisting ? [] : owned.filter(function (name) {',
-      '        return pm.collectionVariables.get(name + "__created") !== "true";',
+      '        return pm.collectionVariables.get(name + "__created") !== "true" ||',
+      '            String(pm.variables.get(name)) !== String(pm.collectionVariables.get(name));',
       '    });',
-      '    if (missing.length > 0 || notOwned.length > 0) {',
+      '    const blockedByOptIn = needsOptIn && !allowExisting;',
+      '    if (missing.length > 0 || notOwned.length > 0 || blockedByOptIn) {',
       `        console.warn("[SKIPPED] " + ${js(label)} +`,
       '            (missing.length ? " - unresolved variables: " + missing.join(", ") : "") +',
-      '            (notOwned.length ? " - only runs against resources created by this run: " + notOwned.join(", ") : ""));',
-      '        pm.execution.skipRequest();',
+      '            (notOwned.length ? " - only runs against resources created by this run: " + notOwned.join(", ") : "") +',
+      '            (blockedByOptIn ? " - modifies data this run did not create; set allowMutationOfExistingData=true to run it" : ""));',
+      '        let skipped = false;',
+      '        try {',
+      '            if (pm.execution && typeof pm.execution.skipRequest === "function") { pm.execution.skipRequest(); skipped = true; }',
+      '        } catch (e) { skipped = false; }',
+      '        if (!skipped) {',
+      '            // Runner without skipRequest (Newman < 6.1): fail closed',
+      '            pm.request.url.update("http://request-skipped.invalid/");',
+      '        }',
       '    }',
       '})();',
     ];
@@ -235,7 +253,8 @@ export class TestScriptGenerator {
       `// expected-status: ${codesLabel(expectation.codes)}`,
     ];
     if (expectation.specGap) {
-      lines.push(`// spec gap: ${endpoint.method} ${endpoint.path} documents none of ${expectation.codes.join('/')}; asserting HTTP-conventional codes`);
+      // Never put spec text in comments: a line terminator in it would end the comment.
+      lines.push(`// spec gap: none of ${expectation.codes.map(Number).join('/')} is documented for this operation`);
     }
     lines.push(
       `pm.test(${js(`${title} → ${codesLabel(expectation.codes)}`)}, function () {`,
@@ -248,7 +267,8 @@ export class TestScriptGenerator {
 
   /**
    * Data-driven body: overlays Newman iteration data onto the example body with
-   * the schema's JSON types restored (CSV values arrive as strings).
+   * the schema's JSON types restored. Columns are named "body.<path>" so they can
+   * never shadow variables such as {{username}} (data scope outranks the environment).
    */
   static dataDrivenBodyScript(example, types) {
     return [
@@ -257,6 +277,7 @@ export class TestScriptGenerator {
       `    const types = ${js(types)};`,
       '    const data = pm.iterationData.toObject();',
       '    function coerce(value, type) {',
+      '        if (type === "string") return value === null || value === undefined ? value : String(value);',
       '        if (typeof value !== "string") return value;',
       '        if (type === "integer" || type === "number") {',
       '            const n = Number(value);',
@@ -268,15 +289,20 @@ export class TestScriptGenerator {
       '        }',
       '        return value;',
       '    }',
+      '    function setOwn(target, key, value) {',
+      '        Object.defineProperty(target, key, { value: value, enumerable: true, writable: true, configurable: true });',
+      '    }',
       '    Object.keys(types).forEach(function (path) {',
-      '        if (!Object.prototype.hasOwnProperty.call(data, path)) return;',
+      '        const column = "body." + path;',
+      '        if (!Object.prototype.hasOwnProperty.call(data, column)) return;',
       '        const keys = path.split(".");',
       '        let target = body;',
       '        for (let i = 0; i < keys.length - 1; i++) {',
-      '            if (typeof target[keys[i]] !== "object" || target[keys[i]] === null) target[keys[i]] = {};',
+      '            const next = Object.prototype.hasOwnProperty.call(target, keys[i]) ? target[keys[i]] : undefined;',
+      '            if (typeof next !== "object" || next === null) setOwn(target, keys[i], {});',
       '            target = target[keys[i]];',
       '        }',
-      '        target[keys[keys.length - 1]] = coerce(data[path], types[path]);',
+      '        setOwn(target, keys[keys.length - 1], coerce(data[column], types[path]));',
       '    });',
       '    pm.variables.set("requestBody", JSON.stringify(body));',
       '})();',

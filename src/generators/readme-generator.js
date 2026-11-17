@@ -1,14 +1,16 @@
 /**
  * README for a generated suite (same content for CLI and MCP).
  */
+import { mdCode, oneLine } from '../core/escape.js';
+
 export function generateSuiteReadme({ apiSpec, files, dataFile, specGaps = [] }) {
   const data = dataFile ? ` \\\n  --iteration-data "${dataFile}"` : '';
-  return `# ${apiSpec.info.title} - Test Suite
+  return `# ${oneLine(apiSpec.info.title)} - Test Suite
 
 Generated from the OpenAPI specification (${apiSpec.specVersion}).
 
-- **Version:** ${apiSpec.info.version}
-- **Base URL:** ${apiSpec.baseUrl || '(not set in the spec - set baseUrl in the environment)'}
+- **Version:** ${oneLine(apiSpec.info.version)}
+- **Base URL:** ${oneLine(apiSpec.baseUrl || '(not set in the spec - set baseUrl in the environment)')}
 - **Operations:** ${apiSpec.endpoints.length}
 
 ## Files
@@ -47,10 +49,10 @@ ${specGaps.length > 0 ? `
 These scenarios have no documented status code; the tests assert the
 HTTP-conventional codes instead:
 
-${specGaps.map(g => `- \`${g.operation}\` - ${g.scenario} (asserting ${g.assertedCodes.join('/')})`).join('\n')}
+${specGaps.map(g => `- ${mdCode(g.operation)} - ${g.scenario} (asserting ${g.assertedCodes.join('/')})`).join('\n')}
 ` : ''}
 ## Operations
 
-${apiSpec.endpoints.map(e => `- \`${e.method} ${e.path}\`${e.summary ? ` - ${e.summary.replace(/\r?\n/g, ' ')}` : ''}`).join('\n')}
+${apiSpec.endpoints.map(e => `- ${mdCode(`${e.method} ${e.path}`)}${e.summary ? ` - ${oneLine(e.summary)}` : ''}`).join('\n')}
 `;
 }

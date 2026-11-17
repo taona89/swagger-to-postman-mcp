@@ -24,6 +24,12 @@ const PASSTHROUGH_KEYWORDS = new Set([
 const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 
+/** Assign an own property even for keys like "__proto__" (spec property names are untrusted). */
+export function setOwn(target, key, value) {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+  return target;
+}
+
 /**
  * Merge allOf members and pick the first oneOf/anyOf branch, producing a single
  * schema that describes one concrete shape. Returns a new shallow object.
@@ -84,12 +90,58 @@ export function schemaType(schema) {
  *  - boolean exclusiveMinimum/exclusiveMaximum become numeric (draft-06+)
  *  - unknown formats, OpenAPI-only and vendor keywords are dropped
  *  - writeOnly properties are removed from response schemas
- *  - cycles and unresolved (external) $refs become `{}` (accept anything)
+ *  - oneOf becomes anyOf (OpenAPI variants often overlap, e.g. with a discriminator)
+ *  - subschemas used more than once, including cycles, are emitted once under
+ *    `definitions` and referenced with $ref, so output size stays linear
+ *  - unresolved (external) $refs become `{}` (accept anything)
  */
-export function toJsonSchema(schema, { mode = 'response' } = {}, depth = 0, stack = []) {
-  if (!isObject(schema) || depth > MAX_DEPTH || stack.includes(schema) || schema.$ref) return {};
-  const next = [...stack, schema];
-  const recurse = s => toJsonSchema(s, { mode }, depth + 1, next);
+export function toJsonSchema(schema, { mode = 'response' } = {}) {
+  if (!isObject(schema) || schema.$ref) return {};
+
+  // Pass 1: count how often each composite node is reached (cycles count twice).
+  const counts = new Map();
+  const visit = node => {
+    if (!isObject(node) || node.$ref) return;
+    counts.set(node, (counts.get(node) || 0) + 1);
+    if (counts.get(node) > 1) return;
+    for (const child of childSchemas(node)) visit(child);
+  };
+  visit(schema);
+  const shared = new Set([...counts].filter(([node, n]) => n > 1 && childSchemas(node).length > 0).map(([node]) => node));
+
+  // Pass 2: convert, replacing shared nodes with $refs into definitions.
+  const definitions = {};
+  const names = new Map();
+  const convert = (node, depth) => {
+    if (!isObject(node) || node.$ref || depth > MAX_DEPTH) return {};
+    if (!shared.has(node)) return convertNode(node, mode, child => convert(child, depth + 1));
+    if (!names.has(node)) {
+      const name = `s${names.size}`;
+      names.set(node, name);
+      definitions[name] = {}; // reserve before converting, so cycles terminate
+      definitions[name] = convertNode(node, mode, child => convert(child, 0));
+    }
+    return { $ref: `#/definitions/${names.get(node)}` };
+  };
+
+  let out = convert(schema, 0);
+  if (out.$ref) out = { allOf: [out] };
+  if (Object.keys(definitions).length > 0) out.definitions = definitions;
+  return out;
+}
+
+function childSchemas(node) {
+  const children = [];
+  for (const prop of Object.values(node.properties || {})) children.push(prop);
+  if (Array.isArray(node.items)) children.push(...node.items);
+  else if (isObject(node.items)) children.push(node.items);
+  if (isObject(node.additionalProperties)) children.push(node.additionalProperties);
+  for (const key of ['allOf', 'oneOf', 'anyOf']) if (Array.isArray(node[key])) children.push(...node[key]);
+  if (isObject(node.not)) children.push(node.not);
+  return children.filter(isObject);
+}
+
+function convertNode(schema, mode, recurse) {
   const hidden = name => {
     const prop = schema.properties?.[name];
     return isObject(prop) && (mode === 'response' ? prop.writeOnly : prop.readOnly) === true;
@@ -114,7 +166,7 @@ export function toJsonSchema(schema, { mode = 'response' } = {}, depth = 0, stac
       case 'properties':
         out.properties = {};
         for (const [name, prop] of Object.entries(value || {})) {
-          if (!hidden(name)) out.properties[name] = recurse(prop);
+          if (!hidden(name)) setOwn(out.properties, name, recurse(prop));
         }
         break;
       case 'required':
@@ -130,9 +182,11 @@ export function toJsonSchema(schema, { mode = 'response' } = {}, depth = 0, stac
         out.additionalProperties = isObject(value) ? recurse(value) : value;
         break;
       case 'allOf':
-      case 'oneOf':
       case 'anyOf':
-        if (Array.isArray(value)) out[key] = value.map(recurse);
+        if (Array.isArray(value)) out[key] = [...(out[key] || []), ...value.map(recurse)];
+        break;
+      case 'oneOf':
+        if (Array.isArray(value)) out.anyOf = [...(out.anyOf || []), ...value.map(recurse)];
         break;
       case 'not':
         out.not = recurse(value);
@@ -294,7 +348,7 @@ export function generateExample(schema, options = {}, depth = 0, stack = []) {
         if (mode === 'request' && prop?.readOnly) continue;
         if (mode === 'response' && prop?.writeOnly) continue;
         const value = generateExample(prop, { ...options, propName: name }, depth + 1, next);
-        if (value !== null) out[name] = value;
+        if (value !== null) setOwn(out, name, value);
       }
       return out;
     }
@@ -362,9 +416,11 @@ export function leafSchemas(schema, prefix = '', depth = 0, stack = []) {
     const key = prefix ? `${prefix}.${name}` : name;
     const flat = flattenSchema(prop);
     if (schemaType(flat) === 'object' && flat.properties) {
-      Object.assign(leaves, leafSchemas(flat, key, depth + 1, [...stack, schema]));
+      for (const [leaf, leafSchema] of Object.entries(leafSchemas(flat, key, depth + 1, [...stack, schema]))) {
+        setOwn(leaves, leaf, leafSchema);
+      }
     } else {
-      leaves[key] = flat;
+      setOwn(leaves, key, flat);
     }
   }
   return leaves;
@@ -372,7 +428,9 @@ export function leafSchemas(schema, prefix = '', depth = 0, stack = []) {
 
 /** Dotted leaf path → JSON type (used to coerce CSV strings back to JSON types). */
 export function leafTypes(schema) {
-  return Object.fromEntries(Object.entries(leafSchemas(schema)).map(([key, s]) => [key, schemaType(s) || 'string']));
+  const types = {};
+  for (const [key, s] of Object.entries(leafSchemas(schema))) setOwn(types, key, schemaType(s) || 'string');
+  return types;
 }
 
 export function singularize(word) {

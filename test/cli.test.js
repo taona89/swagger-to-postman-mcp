@@ -35,6 +35,23 @@ test('CLI accepts flags before positional arguments and keeps existing environme
   assert.equal(env.values.find(v => v.key === 'password').type, 'secret');
 });
 
+test('CLI refuses to write through a symlinked output file', async t => {
+  const out = await tempDir('stp-cli-');
+  const elsewhere = await tempDir('stp-elsewhere-');
+  const target = path.join(elsewhere, 'victim.txt');
+  await fs.writeFile(target, 'original');
+  try {
+    await fs.symlink(target, path.join(out, 'Restful_Booker_README.md'), 'file');
+  } catch {
+    t.skip('file symlinks not permitted on this machine');
+    return;
+  }
+  const run = cli([BOOKER_SPEC, out]);
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /symbolic link/);
+  assert.equal(await fs.readFile(target, 'utf8'), 'original');
+});
+
 test('CLI --no-overwrite refuses to replace files', async () => {
   const out = await tempDir('stp-cli-');
   assert.equal(cli([BOOKER_SPEC, out]).status, 0);

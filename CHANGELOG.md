@@ -29,7 +29,14 @@ Breaking changes are marked **(breaking)**.
 - BDD scenarios use the same oracles as the Postman suites.
 
 ### Security
-- Script injection from spec content is no longer possible (JSON-literal embedding).
+- Script injection from spec content is no longer possible (JSON-literal embedding,
+  U+2028/U+2029 escaped, no spec text in comments; `__proto__` keys preserved).
+- Data-safety guard covers every request that can modify existing data, checks
+  that the captured id is the one in use, and fails closed on old runners.
+- Path policy rejects paths lexically before any filesystem access (no UNC/SMB
+  lookups); output is never written through symlinks; `$ref` resolution re-checks
+  real paths.
+- Markdown outputs keep spec fields on one line; the curl example is shell-quoted.
 - HTML report escapes all spec content and sets a restrictive CSP.
 - MCP file access is limited to allowed roots (MCP roots, project dir,
   `SWAGGER_MCP_ALLOWED_DIRS`). **(breaking)**
@@ -41,6 +48,12 @@ Breaking changes are marked **(breaking)**.
 
 ### MCP server
 - `registerTool` with titles, annotations, output schemas and `structuredContent`.
+- Result shapes changed **(breaking)**: `analyze_openapi` returns `requestBody`
+  (content type or null) instead of `hasRequestBody` and no longer returns the
+  spec description; `validate_spec` returns `errors: string[]` instead of `error`
+  and no longer returns `info.endpoints`; `generate_tests` returns
+  `stats.positiveRequests/negativeRequests`, `specGaps` and `warnings`.
+- Iteration-data columns are named `body.<field>` **(breaking)**.
 - `variables` accepts an object (a JSON string still works).
 - `validate_spec` performs real schema validation.
 - Default output directory no longer depends on the server's working directory.

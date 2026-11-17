@@ -109,6 +109,8 @@ async function main(argv) {
     (v.variables.empty.length ? `; fill in: ${v.variables.empty.join(', ')}` : '') +
     (v.variables.missing.length ? `; missing: ${v.variables.missing.join(', ')}` : ''));
   console.log(`Scripts: ${v.scripts.valid}/${v.scripts.total} compile` + (v.scripts.errors.length ? ` (${v.scripts.errors.length} errors)` : ''));
+  for (const e of v.scripts.errors) console.log(`  script error: ${e.folder} > ${e.request}: ${e.error}`);
+  for (const w of v.scripts.warnings) console.log(`  SCRIPT WARNING: ${w.folder} > ${w.request}: ${w.warning}`);
   for (const gap of result.specGaps) console.log(`Spec gap: ${gap.operation} - ${gap.scenario} (asserting ${gap.assertedCodes.join('/')})`);
   for (const warning of result.warnings) console.log(`Warning: ${warning}`);
 
@@ -119,7 +121,12 @@ async function main(argv) {
   console.log('\nRun:');
   console.log(`  npx newman run "${pos}" -e "${env}"${data ? ` --iteration-data "${path.join(result.outputDir, data)}"` : ''}`);
   console.log(`  npx newman run "${neg}" -e "${env}"`);
-  return v.scripts.errors.length > 0 ? 2 : 0;
+  // Non-zero when a generated script fails to compile or uses risky APIs: never run such a suite unreviewed.
+  if (v.scripts.errors.length > 0 || v.scripts.warnings.length > 0) {
+    console.error('Generated scripts need review (see script errors/warnings above).');
+    return 2;
+  }
+  return 0;
 }
 
 main(process.argv.slice(2))

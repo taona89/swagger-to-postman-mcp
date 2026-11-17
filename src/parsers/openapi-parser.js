@@ -1,8 +1,10 @@
 import SwaggerParser from '@apidevtools/swagger-parser';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OpenAPIWrapper } from '../utils/openapi-wrapper.js';
 import { generateExample } from '../core/schema.js';
+import { isInside } from '../core/paths.js';
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 const PARAM_SCHEMA_KEYS = [
@@ -15,23 +17,28 @@ function toFilePath(url) {
   return path.resolve(url);
 }
 
-function isInside(root, target) {
-  const rel = path.relative(root, target);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+function realpathOrNull(p) {
+  try { return fs.realpathSync(p); } catch { return null; }
 }
 
 /**
  * $ref resolution options: HTTP refs are never fetched (SSRF), and file refs are
- * only followed when they stay inside the directory of the root spec file.
+ * only followed when they stay inside the directory of the root spec file. The
+ * path is checked lexically first (so a UNC path never reaches the filesystem)
+ * and then again after resolving symlinks/junctions.
  */
 function refOptions(baseDir) {
+  const realBase = realpathOrNull(baseDir) || baseDir;
   return {
     resolve: {
       http: false,
       file: {
         canRead: file => {
           if (!/^file:|^[a-z]:[\\/]|^\//i.test(file.url) && !path.isAbsolute(file.url)) return false;
-          return isInside(baseDir, toFilePath(file.url));
+          const target = toFilePath(file.url);
+          if (!isInside(baseDir, target) && !isInside(realBase, target)) return false;
+          const real = realpathOrNull(target);
+          return real !== null && isInside(realBase, real);
         },
       },
     },
@@ -68,10 +75,12 @@ function substituteServerVariables(server) {
 export class OpenAPIParser {
   /** Load the raw document: .txt partial specs are wrapped in memory, never written to disk. */
   async load(input) {
-    if (typeof input === 'string' && /\.txt$/i.test(input)) {
-      return { basePath: path.resolve(input), api: await OpenAPIWrapper.wrapPartialSpec(input) };
+    if (typeof input === 'string') {
+      // Resolve the spec's own symlinks so relative $refs are checked against its real folder.
+      const basePath = realpathOrNull(path.resolve(input)) || path.resolve(input);
+      if (/\.txt$/i.test(input)) return { basePath, api: await OpenAPIWrapper.wrapPartialSpec(basePath) };
+      return { basePath, api: null };
     }
-    if (typeof input === 'string') return { basePath: path.resolve(input), api: null };
     return { basePath: path.resolve('openapi.json'), api: input };
   }
 
@@ -101,7 +110,10 @@ export class OpenAPIParser {
       const { basePath, api: loaded } = await this.load(input);
       api = await SwaggerParser.dereference(basePath, loaded ?? basePath, refOptions(path.dirname(basePath)));
     } catch (error) {
-      throw new Error(`Failed to parse OpenAPI spec: ${error.message}`);
+      const hint = /resolve \$ref/i.test(error.message)
+        ? ' (external $refs are only followed for files inside the spec\'s folder; http(s) refs are never fetched)'
+        : '';
+      throw new Error(`Failed to parse OpenAPI spec: ${error.message}${hint}`);
     }
     return this.normalize(api);
   }
@@ -141,7 +153,8 @@ export class OpenAPIParser {
           // null → the spec does not say whether this operation needs auth
           security: security ?? null,
           requiresAuth: security ? security.length > 0 && !security.some(req => Object.keys(req || {}).length === 0) : undefined,
-          authSchemeKey: requirement ? Object.keys(requirement)[0] : null,
+          // every scheme of the first requirement must be sent together ({ a: [], b: [] } = a AND b)
+          authSchemeKeys: requirement ? Object.keys(requirement) : [],
         });
       }
     }
@@ -193,8 +206,9 @@ export class OpenAPIParser {
     if (!contentType) return null;
     const media = body.content[contentType] || {};
     const schema = media.schema || {};
-    const example = media.example ?? firstExample(media.examples) ?? generateExample(schema, { mode: 'request' });
-    return { required: !!body.required, contentType, schema, example };
+    const specExample = media.example ?? firstExample(media.examples);
+    const example = specExample ?? generateExample(schema, { mode: 'request' });
+    return { required: !!body.required, contentType, schema, example, exampleFromSpec: specExample !== undefined };
   }
 
   swagger2RequestBody(params, operation, api) {
@@ -203,8 +217,9 @@ export class OpenAPIParser {
     if (bodyParam) {
       const contentType = consumes.find(t => /json/i.test(t)) || consumes[0] || 'application/json';
       const schema = bodyParam.schema || {};
-      const example = bodyParam['x-example'] ?? generateExample(schema, { mode: 'request' });
-      return { required: !!bodyParam.required, contentType, schema, example };
+      const specExample = bodyParam['x-example'];
+      const example = specExample ?? generateExample(schema, { mode: 'request' });
+      return { required: !!bodyParam.required, contentType, schema, example, exampleFromSpec: specExample !== undefined };
     }
     const formParams = params.filter(p => p.in === 'formData');
     if (formParams.length === 0) return null;
@@ -219,6 +234,7 @@ export class OpenAPIParser {
       contentType: multipart ? 'multipart/form-data' : 'application/x-www-form-urlencoded',
       schema,
       example: generateExample(schema, { mode: 'request' }),
+      exampleFromSpec: false,
     };
   }
 

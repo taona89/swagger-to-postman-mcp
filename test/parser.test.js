@@ -121,6 +121,43 @@ test('follows file $refs inside the spec folder only, and never fetches http $re
   }
 });
 
+test('file $refs through a junction/symlink to outside the spec folder are refused', async t => {
+  const dir = await tempDir();
+  const secretDir = await tempDir('stp-secret-');
+  await writeJson(path.join(secretDir, 'secret.json'), { type: 'string', example: 'TOPSECRET' });
+  await fs.mkdir(path.join(dir, 'spec'));
+  try {
+    await fs.symlink(secretDir, path.join(dir, 'spec', 'lib'), 'junction');
+  } catch {
+    t.skip('symlinks not permitted on this machine');
+    return;
+  }
+  const file = await writeJson(path.join(dir, 'spec', 'api.json'), {
+    openapi: '3.0.0', info: { title: 'J', version: '1' },
+    paths: { '/a': { get: { responses: { 200: { description: 'ok', content: { 'application/json': { schema: { $ref: './lib/secret.json' } } } } } } } },
+  });
+  await assert.rejects(parser.parse(file), /Unable to resolve \$ref/);
+});
+
+test('combined security requirements send every scheme', async () => {
+  const dir = await tempDir();
+  const file = await writeJson(path.join(dir, 'multi.json'), {
+    openapi: '3.0.3', info: { title: 'M', version: '1' },
+    components: { securitySchemes: {
+      a: { type: 'apiKey', in: 'header', name: 'X-A' },
+      b: { type: 'apiKey', in: 'header', name: 'X-B' },
+      c: { type: 'apiKey', in: 'cookie', name: 'sid' },
+    } },
+    security: [{ a: [], b: [], c: [] }],
+    paths: { '/x': { get: { responses: { 200: { description: 'ok' } } } } },
+  });
+  const spec = await parser.parse(file);
+  const { AuthContext } = await import('../src/core/auth.js');
+  const request = { header: [], url: { raw: '{{baseUrl}}/x' } };
+  new AuthContext(spec).apply(request, spec.endpoints[0]);
+  assert.deepEqual(request.header.map(h => `${h.key}: ${h.value}`), ['X-A: {{apiKey}}', 'X-B: {{apiKey_b}}', 'Cookie: sid={{apiKey_c}}']);
+});
+
 test('wraps partial .txt specs in memory without writing files', async () => {
   const dir = await tempDir();
   const txt = path.join(dir, 'orders_spec.txt');

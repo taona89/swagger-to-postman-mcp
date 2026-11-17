@@ -267,7 +267,9 @@ server.registerTool('verify_collection', {
     const policy = await getPolicy();
     const collection = await readJson(policy, collection_path);
     const empty = { item: [] };
-    const result = { scripts: new ScriptChecker().check(collection, empty) };
+    const checker = new ScriptChecker();
+    const scripts = checker.checkCollection(collection, path.basename(collection_path));
+    const result = { scripts };
     if (env_path) {
       result.variables = new VariableChecker().check(collection, null, await readJson(policy, env_path));
     }

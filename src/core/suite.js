@@ -15,22 +15,26 @@ import { VariableChecker } from '../validators/variable-checker.js';
 import { CoverageChecker } from '../validators/coverage-checker.js';
 import { ScriptChecker } from '../validators/script-checker.js';
 import { buildEnvironment, readEnvironmentValues } from './environment.js';
-import { sanitizeFilename, categorizeEndpoints } from './endpoints.js';
+import { sanitizeFilename } from './endpoints.js';
+import { isOpaqueBody } from './request.js';
 
 export class OverwriteError extends Error {}
 
-async function exists(file) {
-  try { await fs.access(file); return true; } catch { return false; }
+/** lstat-based: also sees dangling symlinks, which fs.access would miss. */
+async function lstatOrNull(file) {
+  try { return await fs.lstat(file); } catch { return null; }
 }
 
 async function writeAll(outputDir, contents, overwrite) {
-  if (!overwrite) {
-    const clashes = [];
-    for (const name of contents.keys()) if (await exists(path.join(outputDir, name))) clashes.push(name);
-    if (clashes.length > 0) {
-      throw new OverwriteError(`Refusing to overwrite existing files in ${outputDir}: ${clashes.join(', ')}. ` +
-        'Pass overwrite: true (CLI: omit --no-overwrite) or choose another output directory.');
-    }
+  const clashes = [];
+  for (const name of contents.keys()) {
+    const stat = await lstatOrNull(path.join(outputDir, name));
+    if (stat?.isSymbolicLink()) throw new OverwriteError(`Refusing to write through the symbolic link ${path.join(outputDir, name)}`);
+    if (stat) clashes.push(name);
+  }
+  if (!overwrite && clashes.length > 0) {
+    throw new OverwriteError(`Refusing to overwrite existing files in ${outputDir}: ${clashes.join(', ')}. ` +
+      'Pass overwrite: true (CLI: omit --no-overwrite) or choose another output directory.');
   }
   await fs.mkdir(outputDir, { recursive: true });
   for (const [name, content] of contents) {
@@ -43,15 +47,22 @@ function suiteWarnings(apiSpec, positiveGenerator, dataFormat) {
   const warnings = [];
   if (!apiSpec.baseUrl) warnings.push('The spec has no server URL: set baseUrl in the environment file.');
   const { plan, auth } = positiveGenerator;
-  const crud = categorizeEndpoints(apiSpec.endpoints, auth.authEndpoint);
-  for (const binding of plan.bindings.values()) {
-    const mutating = [...crud.update, ...crud.delete].filter(e => plan.itemBinding(e) === binding);
-    if (mutating.length > 0 && !binding.createOp) {
-      warnings.push(`${mutating.map(e => e.key).join(', ')}: no create endpoint for ${binding.prefix}, so these requests are skipped ` +
-        'unless allowMutationOfExistingData=true (they would modify data the run did not create).');
+  for (const endpoint of apiSpec.endpoints) {
+    if (auth.isAuthEndpoint(endpoint)) continue;
+    const guard = positiveGenerator.mutationGuard(endpoint);
+    if (guard.needsOptIn) {
+      warnings.push(`${endpoint.key}: skipped unless allowMutationOfExistingData=true (${guard.reason}); it would modify data the run did not create.`);
     }
+    if (isOpaqueBody(endpoint)) {
+      warnings.push(`${endpoint.key}: ${endpoint.requestBody.contentType} body is sent as example text; no field-level negative tests.`);
+    }
+  }
+  for (const binding of plan.bindings.values()) {
     if (!binding.runtime) {
       warnings.push(`Path variable ${binding.varName} (${binding.prefix}/{...}) has no create or list endpoint; set its value in the environment.`);
+    }
+    if (binding.createOp && !binding.deleteOp) {
+      warnings.push(`Resources created via ${binding.createOp.key} are not cleaned up: the spec has no DELETE for ${binding.prefix}/{...}.`);
     }
   }
   if (apiSpec.authSchemes.length > 0 && !auth.authEndpoint) {

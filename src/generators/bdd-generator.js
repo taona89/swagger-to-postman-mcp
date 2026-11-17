@@ -23,11 +23,16 @@ export class BDDGenerator {
     this.auth = new AuthContext(apiSpec);
   }
 
-  /** One feature file per resource: Map of filename → content. */
+  /** One feature file per resource: Map of filename → content (names unique, case-insensitively). */
   generate() {
     const features = new Map();
+    const used = new Set();
     for (const [resource, endpoints] of this.groupByResource()) {
-      features.set(`${this.sanitize(resource)}.feature`, this.generateFeature(resource, endpoints));
+      const base = this.sanitize(resource);
+      let name = base;
+      for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base}_${n}`;
+      used.add(name.toLowerCase());
+      features.set(`${name}.feature`, this.generateFeature(resource, endpoints));
     }
     return features;
   }

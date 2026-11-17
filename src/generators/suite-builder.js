@@ -5,8 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { AuthContext } from '../core/auth.js';
 import { ChainPlan } from '../core/plan.js';
 import { buildRequest } from '../core/request.js';
-import { successExpectation, resourceName, pathSegments } from '../core/endpoints.js';
-import { toJsonSchema, idKeyCandidates } from '../core/schema.js';
+import { successExpectation, resourceName, pathSegments, isPathParamSegment } from '../core/endpoints.js';
+import { toJsonSchema, idKeyCandidates, flattenSchema } from '../core/schema.js';
 import { TestScriptGenerator } from './test-script-generator.js';
 
 const COLLECTION_SCHEMA = 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json';
@@ -67,30 +67,63 @@ export class SuiteBuilder {
     return this.plan.pathBindings(endpoint).filter(e => e.binding.runtime).map(e => e.binding.varName);
   }
 
-  /** Item-level resource a PUT/PATCH/DELETE mutates; must be created by this run. */
-  ownedVars(endpoint) {
-    if (!['PUT', 'PATCH', 'DELETE'].includes(endpoint.method)) return [];
-    const binding = this.plan.itemBinding(endpoint);
-    return binding ? [binding.varName] : [];
+  /**
+   * Ownership requirements for a request that can modify existing data:
+   * every PUT/PATCH/DELETE, and every POST whose path contains a parameter
+   * (sub-resources, actions like /orders/{id}/cancel).
+   *  - each path resource must have been created by this run (owned), except
+   *    parameters replaced by fake values (`exclude`, e.g. a non-existent id);
+   *  - requests that no run can own (collection-level update/delete, path
+   *    values from the environment) need the explicit opt-in.
+   * @returns {{ ownedVars: string[], needsOptIn: boolean, reason: string|null }}
+   */
+  mutationGuard(endpoint, { exclude = [] } = {}) {
+    const segments = pathSegments(endpoint.path);
+    const hasParams = segments.some(s => s.includes('{'));
+    const mutating = ['PUT', 'PATCH', 'DELETE'].includes(endpoint.method) || (endpoint.method === 'POST' && hasParams);
+    if (!mutating) return { ownedVars: [], needsOptIn: false, reason: null };
+
+    if (segments.some(s => s.includes('{') && !isPathParamSegment(s))) {
+      return { ownedVars: [], needsOptIn: true, reason: 'path value comes from the environment' };
+    }
+    if (!hasParams) return { ownedVars: [], needsOptIn: true, reason: 'collection-level operation' };
+
+    const remaining = this.plan.pathBindings(endpoint).filter(entry => !exclude.includes(entry.name));
+    const unowned = remaining.filter(entry => !entry.binding.createOp);
+    if (unowned.length > 0) {
+      return { ownedVars: [], needsOptIn: true, reason: `no create endpoint for ${unowned.map(e => e.binding.prefix).join(', ')}` };
+    }
+    return { ownedVars: remaining.map(entry => entry.binding.varName), needsOptIn: false, reason: null };
   }
 
-  guard(endpoint, label, { owned = true } = {}) {
+  guard(endpoint, label, { exclude = [] } = {}) {
+    const { ownedVars, needsOptIn } = this.mutationGuard(endpoint, { exclude });
     return TestScriptGenerator.guardScript({
       label,
-      requiredVars: this.requiredVars(endpoint),
-      ownedVars: owned ? this.ownedVars(endpoint) : [],
+      requiredVars: this.requiredVars(endpoint).filter(name => !this.plan.pathBindings(endpoint)
+        .some(entry => exclude.includes(entry.name) && entry.binding.varName === name)),
+      ownedVars,
+      needsOptIn,
     });
   }
 
-  /** Authentication request; credentials come from {{username}} / {{password}}. */
+  /**
+   * Authentication request; credentials come from {{username}} / {{password}}.
+   * The environment is pre-filled only with credentials the spec itself gives as
+   * examples; generated placeholders stay empty so the user is asked to fill them.
+   */
   authItem() {
     const endpoint = this.auth.authEndpoint;
     let body = endpoint.requestBody?.example;
     if (body && typeof body === 'object' && !Array.isArray(body)) {
       body = { ...body };
+      const properties = flattenSchema(endpoint.requestBody.schema).properties || {};
       for (const [key, value] of Object.entries(body)) {
-        if (USERNAME_FIELD.test(key)) { this.envDefaults.set('username', String(value ?? '')); body[key] = '{{username}}'; }
-        if (PASSWORD_FIELD.test(key)) { this.envDefaults.set('password', String(value ?? '')); body[key] = '{{password}}'; }
+        const prop = properties[key] || {};
+        const fromSpec = endpoint.requestBody.exampleFromSpec || prop.example !== undefined || prop.default !== undefined;
+        const defaultValue = fromSpec && value !== null && value !== undefined ? String(value) : '';
+        if (USERNAME_FIELD.test(key)) { this.envDefaults.set('username', defaultValue); body[key] = '{{username}}'; }
+        if (PASSWORD_FIELD.test(key)) { this.envDefaults.set('password', defaultValue); body[key] = '{{password}}'; }
       }
     }
     return this.makeItem({

@@ -43,11 +43,13 @@ export class ChainPlan {
       });
     }
 
+    // "/tickets/" and "/tickets" name the same collection
+    const norm = p => String(p).replace(/\/+$/, '') || '/';
     for (const binding of this.bindings.values()) {
       const itemPath = new RegExp(`^${binding.prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\/$/, '')}/\\{[^}]+\\}$`);
-      binding.createOp = apiSpec.endpoints.find(e => e.method === 'POST' && e.path === binding.prefix && !authContext.isAuthEndpoint(e)) || null;
-      binding.listOp = apiSpec.endpoints.find(e => e.method === 'GET' && e.path === binding.prefix) || null;
-      binding.deleteOp = apiSpec.endpoints.find(e => e.method === 'DELETE' && itemPath.test(e.path)) || null;
+      binding.createOp = apiSpec.endpoints.find(e => e.method === 'POST' && norm(e.path) === binding.prefix && !authContext.isAuthEndpoint(e)) || null;
+      binding.listOp = apiSpec.endpoints.find(e => e.method === 'GET' && norm(e.path) === binding.prefix) || null;
+      binding.deleteOp = apiSpec.endpoints.find(e => e.method === 'DELETE' && itemPath.test(norm(e.path))) || null;
       binding.runtime = !!(binding.createOp || binding.listOp);
       if (!binding.runtime) this.staticVars.set(binding.varName, this.exampleFor(binding.param));
     }

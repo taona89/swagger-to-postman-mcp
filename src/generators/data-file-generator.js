@@ -1,15 +1,17 @@
 /**
  * Generates CSV/JSON iteration data files for Newman's --iteration-data flag.
  *
- * Columns are the leaf request-body fields of the create/update operations
- * (nested objects as dotted paths, e.g. "bookingdates.checkin"). The positive
- * suite's data-driven pre-request script overlays each row onto the example
- * body and restores JSON types, so CSV strings become numbers/booleans again.
+ * Columns are the leaf request-body fields of the create/update operations,
+ * prefixed with "body." (nested objects as dotted paths, e.g.
+ * "body.bookingdates.checkin"). The prefix keeps data columns from shadowing
+ * collection variables such as {{username}}, because Newman's data scope
+ * outranks the environment. The positive suite's data-driven pre-request script
+ * overlays each row onto the example body and restores JSON types.
  * Path parameters are never data-driven: ids come from the request chain.
  */
 import RandExp from 'randexp';
 import { AuthContext } from '../core/auth.js';
-import { leafSchemas, generateExample, stripDynamicVariables, schemaType } from '../core/schema.js';
+import { leafSchemas, generateExample, stripDynamicVariables, schemaType, setOwn } from '../core/schema.js';
 
 const FIRST_NAMES = ['Alice', 'Bob', 'Carol', 'David', 'Erin'];
 const LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones'];
@@ -45,7 +47,7 @@ export class DataFileGenerator {
     const rows = [];
     for (let index = 0; index < this.rowCount; index++) {
       const row = {};
-      for (const [path, schema] of this.fields) row[path] = this.valueFor(path, schema, index);
+      for (const [path, schema] of this.fields) setOwn(row, `body.${path}`, this.valueFor(path, schema, index));
       rows.push(row);
     }
     return rows;
@@ -127,17 +129,27 @@ export class DataFileGenerator {
 
   /**
    * CSV for Newman: the first line is always the header row (Newman has no
-   * comment syntax). Arrays/objects are written as JSON and parsed back by the
-   * data-driven body script.
+   * comment syntax). Newman casts unquoted numeric-looking cells to numbers, so
+   * every value except numbers and booleans of a numeric/boolean field is
+   * quoted ("0000" stays a string). Arrays/objects are written as JSON and parsed
+   * back by the data-driven body script.
    */
   toCSV(rows) {
     if (rows.length === 0) return '';
     const headers = Object.keys(rows[0]);
-    const cell = value => {
+    const quote = text => `"${text.replace(/"/g, '""')}"`;
+    const headerCell = text => (/[",\r\n]|^\s|\s$/.test(text) ? quote(text) : text);
+    const typeOf = header => schemaType(this.fields.get(header.replace(/^body\./, '')) || {});
+    const cell = (value, header) => {
       if (value === null || value === undefined) return '';
-      const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
-      return /[",\r\n]|^\s|\s$/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+      const type = typeOf(header);
+      if (typeof value === 'number' && (type === 'integer' || type === 'number')) return String(value);
+      if (typeof value === 'boolean' && type === 'boolean') return String(value);
+      return quote(typeof value === 'object' ? JSON.stringify(value) : String(value));
     };
-    return [headers.map(cell).join(','), ...rows.map(row => headers.map(h => cell(row[h])).join(','))].join('\n');
+    return [
+      headers.map(headerCell).join(','),
+      ...rows.map(row => headers.map(h => cell(row[h], h)).join(',')),
+    ].join('\n');
   }
 }

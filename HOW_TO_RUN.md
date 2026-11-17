@@ -90,13 +90,15 @@ npx newman run generated/<API>_Positive.postman_collection.json -e generated/<AP
   -r cli,htmlextra --reporter-htmlextra-export results.html
 ```
 
-Set `baseUrl` and credentials in the environment file first. Collection
+Set `baseUrl` and credentials in the environment file first. Use Newman 6.1+
+(or a current Postman app): the data-safety guard relies on
+`pm.execution.skipRequest()` and fails closed on older runners. Collection
 variables you can override from the environment:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `responseTimeThresholdMs` | `5000` | Performance assertion threshold |
-| `allowMutationOfExistingData` | `false` | Let update/delete run on records the run did not create |
+| `allowMutationOfExistingData` | `false` | Let requests modify records the run did not create (incl. collection-level deletes) |
 
 ## Troubleshooting
 

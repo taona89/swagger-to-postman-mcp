@@ -23,9 +23,9 @@ response contract broken, auth not enforced, ...).
 | Output | Contents |
 |--------|----------|
 | `*_Positive.postman_collection.json` | One request per operation. Status code asserted against **all documented 2xx codes**; JSON body validated with `pm.response.to.have.jsonSchema()` against the documented schema; response-time threshold. CRUD chaining: create → read → update → delete on the resource the run created. |
-| `*_Negative.postman_collection.json` | Per operation: missing required field (each), wrong type (each property), empty string (only where the schema forbids it), malformed JSON, invalid id format, non-existent id, no credentials (only where auth is required). Disposable test data is created in setup and deleted in teardown. |
+| `*_Negative.postman_collection.json` | Per operation: missing required field (each, except readOnly), wrong type (each property, up to 25 per operation), empty string (only where the schema forbids it), malformed JSON, invalid id format, non-existent id (only when a guaranteed-unused id exists), no credentials (only where auth is required). Disposable test data is created in setup and deleted in teardown. |
 | `*_environment.json` | `baseUrl`, credentials (marked `secret`), and values for path parameters that cannot be chained. |
-| `*_iteration_data.{csv,json}` | Optional. Rows for every request-body field (nested fields as `a.b`); the positive suite becomes data-driven and restores JSON types from CSV strings. |
+| `*_iteration_data.{csv,json}` | Optional. Rows for every request-body field, in columns named `body.<field>` (nested fields as `body.a.b`, so they never shadow variables like `{{username}}`); the positive suite becomes data-driven and restores JSON types. |
 | `*_BDD.feature` | Optional. Gherkin scenarios using the same status oracles as the Postman suites (specification-level, no step definitions). |
 | `*_TechSpec.md`, `*_Report.html`, `*_README.md` | Documentation, HTML summary with coverage and spec gaps, run instructions. |
 
@@ -51,9 +51,17 @@ response contract broken, auth not enforced, ...).
 
 ### Data safety
 
-- Update and delete requests only run against resources **created by the same run**
-  (a pre-request guard skips them otherwise and logs `[SKIPPED]`). Set the collection
-  variable `allowMutationOfExistingData=true` to opt out.
+- Every request that can modify existing data (PUT, PATCH, DELETE, and POST to a
+  path with a parameter such as `/orders/{id}/cancel`) only runs when **every
+  resource in its path was created by the same run**, and the id actually used is
+  the captured one (an environment value of the same name does not count).
+  Collection-level updates/deletes (`DELETE /todos`) and paths whose values come
+  from the environment never qualify. Guarded requests are skipped with a
+  `[SKIPPED]` log line and listed as warnings at generation time. Set the
+  collection variable `allowMutationOfExistingData=true` to opt out.
+- The guard uses `pm.execution.skipRequest()` (Newman 6.1+, current Postman app).
+  On older runners it fails closed by redirecting the request to an unroutable
+  host.
 - The first request of each run clears captured ids, so stale ids from an earlier
   run are never reused.
 - Optional query parameters are included but disabled, so they never filter results
@@ -121,14 +129,19 @@ inside the specs it reads. The server therefore:
 
 - only reads and writes inside **allowed roots**: the client's MCP roots, this
   project directory, and the directories in `SWAGGER_MCP_ALLOWED_DIRS`
-  (separated by `;` on Windows, `:` elsewhere). Symlinks are resolved before the
-  check. Relative paths resolve against the first root (the client's workspace
-  when it provides roots).
+  (separated by `;` on Windows, `:` elsewhere). Paths are checked lexically
+  first (so UNC paths never trigger network lookups), then again after
+  resolving symlinks and junctions. Relative paths resolve against the first
+  root (the client's workspace when it provides roots).
 - never writes from read-only tools (partial `.txt` specs are wrapped in memory);
-- refuses to overwrite existing files unless `overwrite: true`;
-- never fetches `http(s)` `$ref`s and follows file `$ref`s only inside the spec's folder;
-- embeds all spec text in generated scripts as JSON literals and HTML-escapes it in
-  reports, so a hostile spec cannot inject code;
+- refuses to overwrite existing files unless `overwrite: true`, and never writes
+  through a symbolic link;
+- never fetches `http(s)` `$ref`s and follows file `$ref`s only inside the spec's
+  folder (also after resolving symlinks);
+- embeds spec text in generated scripts only as JSON literals (never in comments),
+  HTML-escapes it in reports and keeps Markdown output to one line per field, so a
+  hostile spec cannot inject code; the CLI exits with code 2 if a generated script
+  fails to compile or uses `pm.sendRequest`, `eval` or similar;
 - marks text copied from the spec as untrusted in tool results.
 
 Pass credentials through `env_file` rather than `variables`, so they do not
@@ -189,6 +202,10 @@ CI runs lint and tests on Ubuntu, Windows and macOS with Node 22 and 24.
 - BDD output is specification-level Gherkin; no step definitions are generated.
 - If a broken API wrongly accepts an invalid POST from the negative suite, the
   record it creates is not cleaned up (the test still fails).
+- Resources created by the suites are only deleted when the spec has a DELETE for
+  them (generation warns otherwise).
+- Non-JSON, non-form request bodies (XML, plain text) are sent as the spec's
+  example text, without field-level negative tests.
 - Path parameters whose collection has no create or list endpoint are read from
   the environment; update/delete on those resources are skipped unless
   `allowMutationOfExistingData=true`.

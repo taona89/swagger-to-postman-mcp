@@ -2,7 +2,7 @@
  * Builds Postman request objects (URL, query, headers, body) for an endpoint.
  */
 import { pathSegments } from './endpoints.js';
-import { generateExample, stripDynamicVariables } from './schema.js';
+import { generateExample, stripDynamicVariables, flattenSchema } from './schema.js';
 
 const QUERY_DEFAULTS = {
   page: '1', limit: '10', offset: '0', size: '10', per_page: '10', page_size: '10', pagesize: '10',
@@ -47,10 +47,12 @@ export function buildUrl(endpoint, plan, pathOverrides = {}) {
       ...(p.description ? { description: p.description } : {}),
     }));
   const enabled = query.filter(q => !q.disabled);
+  // Keep a trailing slash: some frameworks (e.g. Django REST) treat /x and /x/ differently.
+  const trailing = segments.length > 0 && String(endpoint.path).endsWith('/');
   const url = {
-    raw: `{{baseUrl}}/${segments.join('/')}${enabled.length ? `?${enabled.map(q => `${q.key}=${q.value}`).join('&')}` : ''}`,
+    raw: `{{baseUrl}}/${segments.join('/')}${trailing ? '/' : ''}${enabled.length ? `?${enabled.map(q => `${q.key}=${q.value}`).join('&')}` : ''}`,
     host: ['{{baseUrl}}'],
-    path: segments,
+    path: trailing ? [...segments, ''] : segments,
   };
   if (query.length > 0) url.query = query;
   return url;
@@ -90,10 +92,24 @@ export function buildBody(endpoint, value, raw) {
     return { header, body: { mode: 'urlencoded', urlencoded: pairs } };
   }
   if (contentType === 'multipart/form-data') {
+    // File fields have no example value; add them so a file can be chosen in Postman.
+    const properties = flattenSchema(endpoint.requestBody?.schema || {}).properties || {};
+    for (const [key, prop] of Object.entries(properties)) {
+      const isFile = prop?.type === 'file' || prop?.format === 'binary' || prop?.format === 'base64';
+      if (isFile && !pairs.some(p => p.key === key)) pairs.push({ key, type: 'file', src: [] });
+    }
     // Postman sets the multipart boundary itself, so no explicit Content-Type header.
     return { header: null, body: { mode: 'formdata', formdata: pairs } };
   }
-  return { header, body: { mode: 'raw', raw: toParamString(value) } };
+  // Other media types (XML, text...): a string example is sent verbatim.
+  return { header, body: { mode: 'raw', raw: typeof value === 'string' ? value : toParamString(value) } };
+}
+
+/** Request body media types the generators can only send as example text. */
+export function isOpaqueBody(endpoint) {
+  const type = endpoint.requestBody?.contentType || '';
+  return !!endpoint.requestBody && !isJson(type)
+    && type !== 'application/x-www-form-urlencoded' && type !== 'multipart/form-data';
 }
 
 /**

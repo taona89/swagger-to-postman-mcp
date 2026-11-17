@@ -1,5 +1,5 @@
 import {
-  categorizeEndpoints, negativeExpectation, NEGATIVE_SCENARIOS, BODY_METHODS, codesLabel,
+  categorizeEndpoints, negativeExpectation, NEGATIVE_SCENARIOS, BODY_METHODS, codesLabel, pathSegments,
 } from '../core/endpoints.js';
 import { buildRequest } from '../core/request.js';
 import { flattenSchema, schemaType, wrongTypeValue, forbidsEmptyString } from '../core/schema.js';
@@ -88,6 +88,8 @@ export class NegativeTestGenerator extends SuiteBuilder {
       const example = body.example;
       if (schemaType(schema) === 'object' && example && typeof example === 'object' && !Array.isArray(example)) {
         for (const field of schema.required || []) {
+          // A readOnly field is never sent by clients, so omitting it is not a fault.
+          if (schema.properties?.[field]?.readOnly) continue;
           const value = structuredClone(example);
           delete value[field];
           tests.push(this.negativeItem(endpoint, 'missingField', `missing required field "${field}"`, { body: value }));
@@ -112,18 +114,19 @@ export class NegativeTestGenerator extends SuiteBuilder {
 
     const itemBinding = this.plan.itemBinding(endpoint);
     if (itemBinding) {
-      const paramName = endpoint.path.split('/').at(-1).slice(1, -1);
+      const paramName = pathSegments(endpoint.path).at(-1).slice(1, -1);
       const param = endpoint.parameters.find(p => p.in === 'path' && p.name === paramName);
+      // The fake id replaces the item parameter; parent resources must still be owned.
       const invalid = this.invalidIdValue(param);
       if (invalid !== null) {
         tests.push(this.negativeItem(endpoint, 'invalidId', `invalid "${paramName}" format (${invalid})`, {
-          pathOverrides: { [paramName]: invalid }, owned: false,
+          pathOverrides: { [paramName]: invalid }, exclude: [paramName],
         }));
       }
       const missing = this.nonExistentIdValue(param);
       if (missing !== null) {
         tests.push(this.negativeItem(endpoint, 'nonExistentId', `non-existent "${paramName}"`, {
-          pathOverrides: { [paramName]: missing }, owned: false,
+          pathOverrides: { [paramName]: missing }, exclude: [paramName],
         }));
       }
     }
@@ -138,19 +141,20 @@ export class NegativeTestGenerator extends SuiteBuilder {
    * @param {object} endpoint
    * @param {string} scenario key of NEGATIVE_SCENARIOS
    * @param {string} detail human description of the single fault
-   * @param {object} options body | rawBody | pathOverrides | omitAuth | owned
+   * @param {object} options body | rawBody | pathOverrides | omitAuth | exclude (params replaced by fake values)
    */
   negativeItem(endpoint, scenario, detail, options = {}) {
     const expectation = negativeExpectation(endpoint, scenario);
-    if (expectation.specGap && !this.specGaps.some(g => g.operation === endpoint.key && g.scenario === scenario)) {
-      this.specGaps.push({ operation: endpoint.key, scenario: NEGATIVE_SCENARIOS[scenario].label, assertedCodes: expectation.codes });
+    const label = NEGATIVE_SCENARIOS[scenario].label;
+    if (expectation.specGap && !this.specGaps.some(g => g.operation === endpoint.key && g.scenario === label)) {
+      this.specGaps.push({ operation: endpoint.key, scenario: label, assertedCodes: expectation.codes });
     }
     const name = `[NEG] ${endpoint.method} ${endpoint.path} - ${detail}`;
     return this.makeItem({
       name,
       description: `Expects ${codesLabel(expectation.codes)}${expectation.specGap ? ' (not documented in the spec)' : ''}.`,
       request: buildRequest(endpoint, this.ctx, options),
-      prerequest: this.guard(endpoint, name, { owned: options.owned !== false }),
+      prerequest: this.guard(endpoint, name, { exclude: options.exclude || [] }),
       test: TestScriptGenerator.negativeScript(endpoint, {
         title: name,
         expectation,
@@ -171,14 +175,21 @@ export class NegativeTestGenerator extends SuiteBuilder {
     return null; // any string is a syntactically valid id
   }
 
+  /**
+   * An id that is valid in format but cannot be a real record. Returns null
+   * when no such value is guaranteed (a bounded range or a pattern), because an
+   * in-range guess could hit an existing record.
+   */
   nonExistentIdValue(param) {
     const schema = flattenSchema(param?.schema || {});
     const type = schemaType(schema);
     if (type === 'integer' || type === 'number') {
-      return typeof schema.maximum === 'number' ? schema.maximum : 2147483647;
+      return typeof schema.maximum === 'number' || typeof schema.exclusiveMaximum === 'number' ? null : 2147483647;
     }
     if (schema.format === 'uuid') return NON_EXISTENT_UUID;
-    if (schema.pattern) return null;
-    return 'does-not-exist-{{$timestamp}}';
+    if (schema.pattern || schema.enum || schema.format) return null;
+    const value = 'does-not-exist-{{$timestamp}}';
+    if (typeof schema.maxLength === 'number' && schema.maxLength < 25) return null;
+    return value;
   }
 }

@@ -223,23 +223,25 @@ test('CSV data files start with the header row and round-trip typed values', asy
   const generator = new DataFileGenerator(spec, { rowCount: 4 });
   const rows = generator.generate();
   const csv = generator.toCSV(rows).split('\n');
-  assert.equal(csv[0], 'name,code,tags,count');
+  assert.equal(csv[0], 'body.name,body.code,body.tags,body.count');
   assert.ok(!csv.some(line => line.startsWith('#')));
   for (const row of rows) {
-    assert.ok(row.name.length <= 8, row.name);
-    assert.match(row.code, /^[A-Z]{3}-\d{2}$/);
-    assert.ok(row.count >= 5 && row.count <= 6, String(row.count));
-    assert.ok(Array.isArray(row.tags));
+    assert.ok(row['body.name'].length <= 8, row['body.name']);
+    assert.match(row['body.code'], /^[A-Z]{3}-\d{2}$/);
+    assert.ok(row['body.count'] >= 5 && row['body.count'] <= 6, String(row['body.count']));
+    assert.ok(Array.isArray(row['body.tags']));
   }
+  // strings and JSON cells are quoted (Newman would cast "0000"-like cells); numbers are not
+  assert.match(csv[1], /^"[^"]*","[A-Z]{3}-\d{2}","\[""[^"]*""\]",\d+$/);
   assert.ok(!csv.join('\n').includes('PATTERN:'));
 });
 
 test('data files exclude path parameters (ids come from the request chain)', async () => {
   const spec = await parse(BOOKER_SPEC);
   const rows = new DataFileGenerator(spec).generate();
-  assert.ok(!('id' in rows[0]));
-  assert.ok(!('username' in rows[0]), 'auth request is not data-driven');
-  assert.ok('bookingdates.checkin' in rows[0]);
+  assert.ok(!('body.id' in rows[0]) && !('id' in rows[0]));
+  assert.ok(!('body.username' in rows[0]), 'auth request is not data-driven');
+  assert.ok('body.bookingdates.checkin' in rows[0]);
 });
 
 test('toJsonSchema produces Ajv 6 compatible schemas', () => {
@@ -249,13 +251,49 @@ test('toJsonSchema produces Ajv 6 compatible schemas', () => {
     secret: { type: 'string', writeOnly: true },
   }, required: ['count', 'secret'] };
   node.properties.self = node;
-  const schema = toJsonSchema(node);
+  const out = toJsonSchema(node);
+  // the cyclic root is emitted once under definitions and referenced
+  assert.deepEqual(out.allOf, [{ $ref: '#/definitions/s0' }]);
+  const schema = out.definitions.s0;
   assert.deepEqual(schema.type, ['object', 'null']);
   assert.deepEqual(schema.properties.count, { type: 'integer', exclusiveMinimum: 0 });
   assert.deepEqual(schema.properties.id, { type: 'string', format: 'uuid' });
   assert.equal(schema.properties.secret, undefined);
   assert.deepEqual(schema.required, ['count']);
-  assert.deepEqual(schema.properties.self, {});
+  assert.deepEqual(schema.properties.self, { $ref: '#/definitions/s0' });
+
+  const variants = toJsonSchema({ oneOf: [{ type: 'object' }, { type: 'object' }], discriminator: { propertyName: 't' } });
+  assert.deepEqual(variants, { anyOf: [{ type: 'object' }, { type: 'object' }] });
+});
+
+test('credentials without spec examples are left empty in the environment', async () => {
+  const dir = await tempDir();
+  const { generateSuite } = await import('../src/core/suite.js');
+  const specPath = await writeJson(path.join(dir, 'creds.json'), {
+    openapi: '3.0.3', info: { title: 'Creds', version: '1' },
+    paths: { '/login': { post: {
+      requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { username: { type: 'string' }, password: { type: 'string' } } } } } },
+      responses: { 200: { description: 'ok' } },
+    } } },
+  });
+  const result = await generateSuite({ specPath, outputDir: path.join(dir, 'out') });
+  // no servers in the spec, no credential examples: all three must be filled in by the user
+  assert.deepEqual(result.verification.variables.empty, ['baseUrl', 'password', 'username']);
+});
+
+test('multipart file fields are included for upload', async () => {
+  const dir = await tempDir();
+  const spec = await parse(await writeJson(path.join(dir, 'upload.json'), {
+    swagger: '2.0', info: { title: 'Up', version: '1' },
+    paths: { '/files': { post: {
+      consumes: ['multipart/form-data'],
+      parameters: [{ in: 'formData', name: 'file', type: 'file', required: true }, { in: 'formData', name: 'label', type: 'string' }],
+      responses: { 201: { description: 'ok' } },
+    } } },
+  }));
+  const item = requestItems(new PositiveTestGenerator(spec).generate()).find(i => i.request.method === 'POST');
+  assert.equal(item.request.body.mode, 'formdata');
+  assert.deepEqual(item.request.body.formdata.find(f => f.key === 'file'), { key: 'file', type: 'file', src: [] });
 });
 
 test('generateExample gives sibling properties sharing a schema object their own values', () => {

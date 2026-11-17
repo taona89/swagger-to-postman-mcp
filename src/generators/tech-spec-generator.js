@@ -2,7 +2,7 @@
  * Technical Specification Generator
  * Generates comprehensive technical documentation from OpenAPI specifications
  */
-import { mdCell } from '../core/escape.js';
+import { mdCell, mdCode, oneLine, shellQuote } from '../core/escape.js';
 import { flattenSchema, schemaType, stripDynamicVariables } from '../core/schema.js';
 
 export class TechSpecGenerator {
@@ -31,8 +31,8 @@ export class TechSpecGenerator {
    * Generate document header
    */
   generateHeader() {
-    const title = this.apiSpec.info.title || 'API';
-    const version = this.apiSpec.info.version || '1.0.0';
+    const title = oneLine(this.apiSpec.info.title || 'API');
+    const version = oneLine(this.apiSpec.info.version || '1.0.0');
     const date = new Date().toISOString().split('T')[0];
 
     return `# ${title} - Technical Specification
@@ -45,8 +45,8 @@ export class TechSpecGenerator {
 
 | Property | Value |
 |----------|-------|
-| API Name | ${title} |
-| Version | ${version} |
+| API Name | ${mdCell(title)} |
+| Version | ${mdCell(version)} |
 | Base URL | ${mdCell(this.apiSpec.baseUrl || '(not set)')} |
 | Spec Format | ${this.apiSpec.specVersion} |
 | Generated | ${date} |`;
@@ -111,19 +111,19 @@ This API does not require authentication.`;
 ${this.apiSpec.authSchemes.map(scheme => {
   if (scheme.type === 'apiKey') {
     const example = scheme.in === 'header'
-      ? `${scheme.paramName}: <api-key>`
-      : scheme.in === 'cookie' ? `Cookie: ${scheme.paramName}=<api-key>` : `?${scheme.paramName}=<api-key>`;
-    return `#### ${scheme.key} (API key)
+      ? `${oneLine(scheme.paramName).replace(/`/g, "'")}: <api-key>`
+      : scheme.in === 'cookie' ? `Cookie: ${oneLine(scheme.paramName).replace(/`/g, "'")}=<api-key>` : `?${oneLine(scheme.paramName).replace(/`/g, "'")}=<api-key>`;
+    return `#### ${oneLine(scheme.key)} (API key)
 
-- **Location:** ${scheme.in}
-- **Parameter Name:** \`${scheme.paramName}\`
+- **Location:** ${oneLine(scheme.in)}
+- **Parameter Name:** ${mdCode(scheme.paramName)}
 
 **Example:**
 \`\`\`
 ${example}
 \`\`\``;
   } else if (scheme.type === 'http') {
-    return `#### ${scheme.key} (HTTP ${scheme.scheme || 'auth'})
+    return `#### ${oneLine(scheme.key)} (HTTP ${oneLine(scheme.scheme || 'auth')})
 
 - **Location:** Authorization header
 
@@ -132,7 +132,7 @@ ${example}
 Authorization: ${scheme.scheme === 'basic' ? 'Basic <base64 username:password>' : 'Bearer <token>'}
 \`\`\``;
   }
-  return `#### ${scheme.key} (${scheme.type})\n\nSee the API documentation for details.`;
+  return `#### ${oneLine(scheme.key)} (${oneLine(scheme.type)})\n\nSee the API documentation for details.`;
 }).join('\n\n')}`;
   }
 
@@ -190,7 +190,7 @@ ${this.apiSpec.endpoints.map(e =>
    * Generate section for a tag group
    */
   generateTagSection(tag, endpoints) {
-    return `#### ${this.formatTagName(tag)}
+    return `#### ${oneLine(this.formatTagName(tag))}
 
 ${endpoints.map(endpoint => this.generateEndpointDetails(endpoint)).join('\n\n')}`;
   }
@@ -203,9 +203,9 @@ ${endpoints.map(endpoint => this.generateEndpointDetails(endpoint)).join('\n\n')
     const queryParams = endpoint.parameters.filter(p => p.in === 'query');
     const hasBody = endpoint.requestBody && endpoint.requestBody.schema;
 
-    return `##### ${endpoint.method} ${endpoint.path}
+    return `##### ${endpoint.method} ${mdCode(endpoint.path)}
 
-**Summary:** ${endpoint.summary || 'No summary'}
+**Summary:** ${oneLine(endpoint.summary || 'No summary')}
 
 **Description:** ${endpoint.description || 'No description provided'}
 
@@ -227,7 +227,7 @@ ${queryParams.map(p =>
 ).join('\n')}
 ` : ''}
 
-${hasBody ? `**Request Body** (\`${endpoint.requestBody.contentType}\`):
+${hasBody ? `**Request Body** (${mdCode(endpoint.requestBody.contentType)}):
 
 \`\`\`json
 ${JSON.stringify(stripDynamicVariables(endpoint.requestBody.example), null, 2)}
@@ -244,9 +244,9 @@ ${this.generateResponsesTable(endpoint.responses)}
 **Example Request:**
 
 \`\`\`bash
-curl -X ${endpoint.method} "${this.apiSpec.baseUrl}${endpoint.path}"${hasBody ? ` \\
-  -H "Content-Type: ${endpoint.requestBody.contentType}" \\
-  -d '${JSON.stringify(stripDynamicVariables(endpoint.requestBody.example)).replace(/'/g, "'\\''")}'` : ''}
+curl -X ${endpoint.method} ${shellQuote(oneLine(`${this.apiSpec.baseUrl}${endpoint.path}`))}${hasBody ? ` \\
+  -H ${shellQuote(oneLine(`Content-Type: ${endpoint.requestBody.contentType}`))} \\
+  -d ${shellQuote(oneLine(JSON.stringify(stripDynamicVariables(endpoint.requestBody.example))))}` : ''}
 \`\`\``;
   }
 
@@ -299,11 +299,11 @@ ${Object.entries(this.apiSpec.schemas).map(([name, schema]) =>
    * Generate schema documentation
    */
   generateSchemaDoc(name, schema) {
-    return `### ${name}
+    return `### ${oneLine(name)}
 
 ${schema.description || 'No description provided'}
 
-**Type:** ${schema.type || 'object'}
+**Type:** ${oneLine(schemaType(schema) || 'object')}
 
 ${schema.properties ? `**Properties:**
 
@@ -379,13 +379,13 @@ ${rows.join('\n')}` : '_The specification documents no 4xx/5xx responses._'}`;
   generateVersioning() {
     return `## API Versioning
 
-**Current Version:** ${this.apiSpec.info.version || '1.0.0'}
+**Current Version:** ${oneLine(this.apiSpec.info.version || '1.0.0')}
 
 ### Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
-| ${this.apiSpec.info.version || '1.0.0'} | ${new Date().toISOString().split('T')[0]} | Initial specification |
+| ${mdCell(this.apiSpec.info.version || '1.0.0')} | ${new Date().toISOString().split('T')[0]} | Initial specification |
 
 ### Versioning Strategy
 

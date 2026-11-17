@@ -27,11 +27,21 @@ export class AuthContext {
     return !!this.authEndpoint && endpoint.key === this.authEndpoint.key;
   }
 
-  /** Security scheme used by an endpoint (first scheme when the spec is silent). */
-  schemeFor(endpoint) {
-    if (endpoint.security === null) return this.schemes[0] || null;
-    if (!endpoint.requiresAuth) return null;
-    return this.schemes.find(s => s.key === endpoint.authSchemeKey) || this.schemes[0] || null;
+  /**
+   * Security schemes an endpoint must send together (all schemes of its first
+   * requirement; the first defined scheme when the spec is silent).
+   */
+  schemesFor(endpoint) {
+    if (endpoint.security === null) return this.schemes.slice(0, 1);
+    if (!endpoint.requiresAuth) return [];
+    const schemes = (endpoint.authSchemeKeys || []).map(key => this.schemes.find(s => s.key === key)).filter(Boolean);
+    return schemes.length > 0 ? schemes : this.schemes.slice(0, 1);
+  }
+
+  /** Variable holding the key for an apiKey scheme: the first one uses {{apiKey}}. */
+  apiKeyVariable(scheme) {
+    const first = this.schemes.find(s => s.type === 'apiKey');
+    return !first || first.key === scheme.key ? 'apiKey' : `apiKey_${scheme.key.replace(/[^A-Za-z0-9_]/g, '_')}`;
   }
 
   /** Whether requests for this endpoint should carry credentials. */
@@ -57,32 +67,37 @@ export class AuthContext {
   /** Add credentials to a Postman request object (mutates and returns it). */
   apply(request, endpoint) {
     if (!this.sendsAuth(endpoint)) return request;
-    const scheme = this.schemeFor(endpoint);
+    const schemes = this.schemesFor(endpoint);
 
-    if (!scheme) {
+    if (schemes.length === 0) {
       // Auth endpoint but no declared scheme: token cookie convention.
       request.header.push({ key: 'Cookie', value: 'token={{token}}', type: 'text' });
       return request;
     }
-    if (scheme.type === 'http' && scheme.scheme === 'basic') {
-      request.auth = {
-        type: 'basic',
-        basic: [
-          { key: 'username', value: '{{username}}', type: 'string' },
-          { key: 'password', value: '{{password}}', type: 'string' },
-        ],
-      };
-    } else if (scheme.type === 'apiKey' && scheme.in === 'query') {
-      request.url.query = [...(request.url.query || []), { key: scheme.paramName, value: '{{apiKey}}' }];
-      request.url.raw += `${request.url.raw.includes('?') ? '&' : '?'}${scheme.paramName}={{apiKey}}`;
-    } else if (scheme.type === 'apiKey' && scheme.in === 'cookie') {
-      request.header.push({ key: 'Cookie', value: `${scheme.paramName}={{apiKey}}`, type: 'text' });
-    } else if (scheme.type === 'apiKey') {
-      request.header.push({ key: scheme.paramName || 'X-API-Key', value: '{{apiKey}}', type: 'text' });
-    } else {
-      // http bearer, oauth2, openIdConnect
-      request.header.push({ key: 'Authorization', value: 'Bearer {{token}}', type: 'text' });
+    const cookies = [];
+    for (const scheme of schemes) {
+      const keyVar = `{{${this.apiKeyVariable(scheme)}}}`;
+      if (scheme.type === 'http' && scheme.scheme === 'basic') {
+        request.auth = {
+          type: 'basic',
+          basic: [
+            { key: 'username', value: '{{username}}', type: 'string' },
+            { key: 'password', value: '{{password}}', type: 'string' },
+          ],
+        };
+      } else if (scheme.type === 'apiKey' && scheme.in === 'query') {
+        request.url.query = [...(request.url.query || []), { key: scheme.paramName, value: keyVar }];
+        request.url.raw += `${request.url.raw.includes('?') ? '&' : '?'}${scheme.paramName}=${keyVar}`;
+      } else if (scheme.type === 'apiKey' && scheme.in === 'cookie') {
+        cookies.push(`${scheme.paramName}=${keyVar}`);
+      } else if (scheme.type === 'apiKey') {
+        request.header.push({ key: scheme.paramName || 'X-API-Key', value: keyVar, type: 'text' });
+      } else {
+        // http bearer, oauth2, openIdConnect
+        request.header.push({ key: 'Authorization', value: 'Bearer {{token}}', type: 'text' });
+      }
     }
+    if (cookies.length > 0) request.header.push({ key: 'Cookie', value: cookies.join('; '), type: 'text' });
     return request;
   }
 
