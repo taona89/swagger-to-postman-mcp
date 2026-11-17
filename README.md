@@ -1,325 +1,201 @@
 # swagger-to-postman-mcp
 
-![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-blueviolet)
-![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%7C%20Swagger%202.0-85EA2D?logo=swagger&logoColor=white)
-![Postman](https://img.shields.io/badge/Postman-Collections-FF6C37?logo=postman&logoColor=white)
+![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%7C%203.1%20%7C%20Swagger%202.0-85EA2D?logo=swagger&logoColor=white)
 
-> **An MCP server that turns any OpenAPI/Swagger spec into a full Postman test suite in seconds** — positive tests, negative tests, BDD scenarios, data-driven iteration files, HTML reports, and documentation. No manual test writing required.
+> An MCP server and CLI that turn an OpenAPI / Swagger spec into runnable Postman
+> suites: positive tests with response-schema contract checks, negative tests with
+> one fault per request, a Postman environment, optional data-driven iteration
+> files, BDD scenarios, a tech spec and an HTML summary.
 
----
-
-## Why This Exists
-
-Writing Postman collections by hand is slow, inconsistent, and error-prone. This tool reads your API contract (OpenAPI/Swagger) and automatically generates production-ready test suites that cover happy paths, error cases, contract validation, and edge cases — all wired up with proper assertions, authentication, and environment variables.
-
-It ships as both a **CLI tool** and an **MCP server**, so it works standalone or directly inside AI clients like Claude Desktop.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Input                                    │
-│         OpenAPI 3.0 / Swagger 2.0 (.yaml .json .txt)       │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  OpenAPI Parser                             │
-│   Resolves $ref · Extracts endpoints, schemas, auth        │
-│   Handles allOf / oneOf / anyOf composition                │
-└──────┬────────────┬──────────────┬───────────┬─────────────┘
-       │            │              │           │
-       ▼            ▼              ▼           ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
-│ Positive │ │ Negative │ │   BDD    │ │  Data File   │
-│Generator │ │Generator │ │Generator │ │  Generator   │
-│          │ │          │ │          │ │ (CSV / JSON) │
-└────┬─────┘ └────┬─────┘ └────┬─────┘ └──────┬───────┘
-     │            │             │              │
-     └────────────┴─────────────┴──────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Validators                                │
-│      Variable completeness · Coverage % · Script syntax    │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Output                                   │
-│  *_Positive.json  *_Negative.json  *_environment.json      │
-│  *_BDD.feature    *_TechSpec.md    *_Report.html           │
-│  *_iteration_data.json/.csv                                │
-└─────────────────────────────────────────────────────────────┘
-```
+The generated suites are verified in this repo's own test suite: they are run
+with Newman against a spec-compliant mock API and must pass with zero failures,
+must leave the API's existing data untouched, and must **fail** when the mock is
+switched into one of several deliberately broken modes (wrong types accepted,
+response contract broken, auth not enforced, ...).
 
 ---
 
-## Features
+## What gets generated
 
-| Feature | Details |
-|---------|---------|
-| **CRUD Detection** | Automatically categorizes endpoints into Create / Read / Update / Delete / List |
-| **Positive Tests** | Status codes, response time, payload validation, contract assertions |
-| **Negative Tests** | Missing fields, empty values, invalid types, malformed JSON, invalid IDs, no auth |
-| **Contract Testing** | Schema validation against OpenAPI response definitions |
-| **BDD Generation** | Gherkin `.feature` files with `@positive`, `@negative`, `@contract` tags |
-| **Data-Driven Tests** | CSV/JSON iteration files for Newman `--iteration-data` with smart value generation |
-| **$ref Resolution** | Resolves `$ref`, `allOf`, `oneOf`, `anyOf` for nested schema extraction |
-| **Auth Handling** | Cookie-based auth, bearer tokens, API keys |
-| **Environment Files** | Ready-to-use Postman environment with smart example values |
-| **Variable Injection** | Override or pre-fill env variables at generation time |
-| **Post-Generation Checks** | Variable completeness, endpoint coverage %, script syntax validation |
-| **HTML Reports** | Visual summary of generated suite — importable into Postman |
+| Output | Contents |
+|--------|----------|
+| `*_Positive.postman_collection.json` | One request per operation. Status code asserted against **all documented 2xx codes**; JSON body validated with `pm.response.to.have.jsonSchema()` against the documented schema; response-time threshold. CRUD chaining: create → read → update → delete on the resource the run created. |
+| `*_Negative.postman_collection.json` | Per operation: missing required field (each), wrong type (each property), empty string (only where the schema forbids it), malformed JSON, invalid id format, non-existent id, no credentials (only where auth is required). Disposable test data is created in setup and deleted in teardown. |
+| `*_environment.json` | `baseUrl`, credentials (marked `secret`), and values for path parameters that cannot be chained. |
+| `*_iteration_data.{csv,json}` | Optional. Rows for every request-body field (nested fields as `a.b`); the positive suite becomes data-driven and restores JSON types from CSV strings. |
+| `*_BDD.feature` | Optional. Gherkin scenarios using the same status oracles as the Postman suites (specification-level, no step definitions). |
+| `*_TechSpec.md`, `*_Report.html`, `*_README.md` | Documentation, HTML summary with coverage and spec gaps, run instructions. |
 
----
+### How the tests decide pass/fail
 
-## Demo
+- **Positive status:** any status code the spec documents as 2xx for that operation.
+- **Negative status:** the codes that are correct for the scenario, intersected with
+  the codes the spec documents:
 
-### CLI — Generate from an OpenAPI spec
+  | Scenario | Acceptable codes |
+  |----------|-----------------|
+  | missing field / wrong type / empty value | 400, 422 |
+  | malformed JSON | 400 |
+  | invalid id format | 400, 404, 422 |
+  | non-existent id | 404, 410 |
+  | no credentials | 401, 403 |
 
-```bash
-node generate.js swagger/my-api.yaml generated --data-file json --row-count 5 --bdd
-```
+  If the spec documents none of them, the conventional codes are asserted and the
+  operation is listed as a **spec gap** (tool result, README, HTML report).
+- **Contract:** the documented schema of whichever status code came back, converted
+  to a JSON Schema the Postman sandbox (Ajv 6) accepts (`nullable`, boolean
+  `exclusiveMinimum`, OpenAPI-only formats and keywords handled).
 
-```
-✅ Parsed: My API v1.0.0 — 24 endpoints
-[1/4] Generating positive test collection...   ✅ My_API_Positive.postman_collection.json
-[2/4] Generating negative test collection...   ✅ My_API_Negative.postman_collection.json
-[3/4] Generating environment file...           ✅ My_API_environment.json (18 variables)
-[4/4] Generating documentation...              ✅ My_API_TechSpec.md
+### Data safety
 
-VERIFICATION
-✅ 16/18 variables resolved
-✅ 24/24 endpoints covered in positive tests (100%)
-✅ 29/29 test scripts have valid syntax
-```
-
-### Run data-driven tests with Newman
-
-```bash
-npx newman run generated/My_API_Positive.postman_collection.json \
-  -e generated/My_API_environment.json \
-  --iteration-data generated/My_API_iteration_data.json \
-  --reporters cli,htmlextra \
-  --reporter-htmlextra-export results.html
-```
+- Update and delete requests only run against resources **created by the same run**
+  (a pre-request guard skips them otherwise and logs `[SKIPPED]`). Set the collection
+  variable `allowMutationOfExistingData=true` to opt out.
+- The first request of each run clears captured ids, so stale ids from an earlier
+  run are never reused.
+- Optional query parameters are included but disabled, so they never filter results
+  by accident.
 
 ---
 
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/taona89/swagger-to-postman-mcp.git
 cd swagger-to-postman-mcp
-npm install
+npm ci
 ```
 
-**Requirements:** Node.js >= 18.0.0
+Requires Node.js 22 or newer.
 
----
+## Use as an MCP server
 
-## Usage
-
-### Option 1 — CLI
+Claude Code:
 
 ```bash
-# Basic generation
-node generate.js swagger/my-api.yaml generated
-
-# With data-driven iteration file (JSON or CSV)
-node generate.js swagger/my-api.yaml generated --data-file json --row-count 5
-
-# With BDD feature files
-node generate.js swagger/my-api.yaml generated --bdd
-
-# Inject custom variables
-node generate.js swagger/my-api.yaml generated --variables '{"baseUrl":"https://staging.example.com"}'
-
-# Reuse values from an existing environment file
-node generate.js swagger/my-api.yaml generated --env-file ./existing_environment.json
+claude mcp add swagger-to-postman -- node /absolute/path/to/swagger-to-postman-mcp/index.js
 ```
 
-### Option 2 — MCP Server (Claude Desktop / Claude Code)
-
-Start the server:
-
-```bash
-node index.js
-```
-
-Add to Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Claude Desktop (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "swagger-to-postman": {
       "command": "node",
-      "args": ["/path/to/swagger-to-postman-mcp/index.js"]
+      "args": ["/absolute/path/to/swagger-to-postman-mcp/index.js"],
+      "env": { "SWAGGER_MCP_ALLOWED_DIRS": "/absolute/path/to/your/specs" }
     }
   }
 }
 ```
 
-Then ask Claude:
+Try it without a client: `npx @modelcontextprotocol/inspector node index.js`
 
-> "Generate the full test suite from `swagger/my-api.yaml`"
-> "Generate BDD feature files from `swagger/my-api.yaml`"
-> "Verify the collection at `generated/My_API_Positive.postman_collection.json`"
+### Tools
 
-### Option 3 — MCP Inspector (browser UI, no client needed)
+| Tool | Writes files | Description |
+|------|:---:|-------------|
+| `list_swagger_files` | no | Specs in this repo's `swagger/` directory |
+| `analyze_openapi` | no | Operations, parameters, auth schemes |
+| `validate_spec` | no | Schema validation (OpenAPI 3.0/3.1, Swagger 2.0) |
+| `generate_tests` | yes | Full suite; see parameters below |
+| `verify_collection` | no | Script syntax, risky script APIs (`pm.sendRequest`, `eval`...), variable resolution, coverage |
+| `generate_bdd` | yes | Gherkin feature file(s) |
 
-```bash
-npx @modelcontextprotocol/inspector node index.js
-```
+All tools declare MCP annotations (`readOnlyHint`, `destructiveHint`) and an
+`outputSchema`; results are returned as `structuredContent`.
 
----
+`generate_tests` parameters: `spec_path` (required), `output_dir`,
+`generate_data_file`, `data_format` (`csv`|`json`), `row_count`, `variables`
+(object of environment overrides), `env_file`, `overwrite` (default **false**),
+`response_time_ms`.
 
-## MCP Tools
+### Security model
 
-| Tool | Description |
-|------|-------------|
-| `list_swagger_files` | List all OpenAPI specs in the `swagger/` directory |
-| `analyze_openapi` | Parse and inspect a spec without generating files |
-| `validate_spec` | Validate a spec before generation |
-| `generate_tests` | Generate full test suite — positive, negative, environment, report, data file |
-| `verify_collection` | Check variable completeness, script syntax, and endpoint coverage |
-| `generate_bdd` | Generate Gherkin `.feature` files |
+Tool arguments are chosen by a language model, which can be influenced by text
+inside the specs it reads. The server therefore:
 
-### `generate_tests` parameters
+- only reads and writes inside **allowed roots**: the client's MCP roots, this
+  project directory, and the directories in `SWAGGER_MCP_ALLOWED_DIRS`
+  (separated by `;` on Windows, `:` elsewhere). Symlinks are resolved before the
+  check. Relative paths resolve against the first root (the client's workspace
+  when it provides roots).
+- never writes from read-only tools (partial `.txt` specs are wrapped in memory);
+- refuses to overwrite existing files unless `overwrite: true`;
+- never fetches `http(s)` `$ref`s and follows file `$ref`s only inside the spec's folder;
+- embeds all spec text in generated scripts as JSON literals and HTML-escapes it in
+  reports, so a hostile spec cannot inject code;
+- marks text copied from the spec as untrusted in tool results.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `spec_path` | string | required | Path to OpenAPI/Swagger file |
-| `output_dir` | string | `./generated` | Output directory |
-| `generate_data_file` | boolean | false | Generate Newman iteration data file |
-| `data_format` | `csv` \| `json` | `json` | Data file format |
-| `row_count` | integer | 3 | Number of data rows to generate |
-| `variables` | string (JSON) | — | Custom variables to inject into environment |
-| `env_file` | string | — | Existing environment file to reuse values from |
+Pass credentials through `env_file` rather than `variables`, so they do not
+appear in the conversation.
 
----
-
-## Generated Output
-
-```
-generated/
-├── My_API_Positive.postman_collection.json   # Happy-path CRUD tests
-├── My_API_Negative.postman_collection.json   # Error / edge case tests
-├── My_API_environment.json                   # Postman environment variables
-├── My_API_TechSpec.md                        # Full API technical specification
-├── My_API_Report.html                        # Visual HTML summary
-├── My_API_BDD.feature                        # Gherkin scenarios (with --bdd)
-└── My_API_iteration_data.json                # Data-driven test rows (with --data-file)
-```
-
-### Positive Collection Structure
-
-```
-0. Authentication       → Login, store auth token/cookie
-1. Setup               → Extract reference IDs for downstream tests
-2. LIST Operations     → GET endpoints (no path params)
-3. CREATE Operations   → POST endpoints
-4. READ Operations     → GET endpoints with ID
-5. UPDATE Operations   → PUT / PATCH endpoints
-6. DELETE Operations   → DELETE endpoints
-```
-
-### Negative Collection Structure
-
-```
-Per writable endpoint:
-  ├── Missing Required Field: [field]
-  ├── Empty [field]
-  ├── Invalid [field] Type
-  ├── Malformed JSON Body
-  ├── Invalid ID
-  ├── Non-existent ID
-  └── No Authentication
-```
-
----
-
-## Data-Driven Generation
-
-The data file generator produces varied test rows by extracting all parameterizable fields from the spec:
-
-- **Path parameters** — `GET /bookings/{id}`
-- **Query parameters** — `GET /bookings?status=active`
-- **Request body properties** — with full `$ref`, `allOf`, `oneOf`, `anyOf` resolution and nested object flattening
-
-Value generation respects:
-- `format` — `uuid`, `date`, `date-time`, `email`, `uri`
-- `enum` — rotates through defined values
-- `minimum` / `maximum` — for numeric fields
-- `minLength` — pads strings to meet constraint
-- `pattern` — surfaces `PATTERN:<regex>` placeholder
-- `example` — uses spec-provided examples first
-- Name heuristics — `email`, `status`, `role`, `priority`, `city`, `country`, etc.
+## Use as a CLI
 
 ```bash
-# Generate 10 rows in CSV format
-node generate.js swagger/my-api.yaml generated --data-file csv --row-count 10
+node generate.js swagger/restful_booker.json ./generated
+node generate.js ./api.yaml ./out --data-file csv --row-count 5 --bdd
+node generate.js ./api.yaml ./out --variables '{"baseUrl":"https://staging.example.com"}'
+node generate.js ./api.yaml ./out --env-file ./existing_environment.json --no-overwrite
+```
 
-# Run with Newman
-npx newman run generated/My_API_Positive.postman_collection.json \
-  -e generated/My_API_environment.json \
-  --iteration-data generated/My_API_iteration_data.csv
+Re-running into the same directory keeps values you already put in the
+environment file. Then:
+
+```bash
+npx newman run generated/Restful_Booker_Positive.postman_collection.json -e generated/Restful_Booker_environment.json
+npx newman run generated/Restful_Booker_Negative.postman_collection.json -e generated/Restful_Booker_environment.json
 ```
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
-swagger-to-postman-mcp/
-├── index.js                          # MCP server entry point
-├── generate.js                       # CLI entry point
-├── swagger/                          # Place your OpenAPI specs here
-└── src/
-    ├── parsers/
-    │   └── openapi-parser.js         # OpenAPI 3.0 + Swagger 2.0 parser
-    ├── generators/
-    │   ├── positive-generator.js     # Positive test collection builder
-    │   ├── negative-generator.js     # Negative test collection builder
-    │   ├── test-script-generator.js  # Postman test assertion scripts
-    │   ├── data-file-generator.js    # CSV/JSON iteration data generator
-    │   ├── bdd-generator.js          # Gherkin BDD feature file generator
-    │   ├── html-report-generator.js  # HTML report generator
-    │   └── tech-spec-generator.js    # Markdown tech spec generator
-    ├── validators/
-    │   ├── variable-checker.js       # {{variable}} completeness check
-    │   ├── coverage-checker.js       # Endpoint coverage %
-    │   └── script-checker.js         # Test script syntax validation
-    └── utils/
-        └── openapi-wrapper.js        # Auto-wraps partial .txt specs
+index.js                     MCP server (tools, path policy, structured results)
+generate.js                  CLI
+src/core/                    shared logic
+  suite.js                   generateSuite()/generateBdd(): used by CLI and MCP
+  schema.js                  example generation, OpenAPI → Ajv 6 JSON Schema, cycle-safe
+  endpoints.js               CRUD classification and status-code oracles
+  auth.js                    auth endpoint detection, per-operation security
+  plan.js                    request chaining (which variable feeds which path parameter)
+  request.js                 Postman request/URL/body builders
+  environment.js             environment builder, variable scanning
+  paths.js                   allowed-roots file access policy
+  escape.js                  JS / HTML / Markdown / Gherkin escaping
+src/parsers/openapi-parser.js  @apidevtools/swagger-parser + Swagger 2.0 normalization
+src/generators/              positive, negative, data file, BDD, tech spec, HTML, README
+src/validators/              variable, coverage and script checkers
+test/                        unit, CLI, MCP-protocol and Newman integration tests
+test/fixtures/restful-booker-mock.js  spec-compliant mock with switchable defects
 ```
 
----
+## Development
 
-## Tech Stack
+```bash
+npm test        # node:test: unit, CLI, MCP protocol and Newman end-to-end tests
+npm run lint    # ESLint
+```
 
-- **Runtime:** Node.js (ESM)
-- **MCP Protocol:** `@modelcontextprotocol/sdk`
-- **Spec Parsing:** `swagger-parser`, `js-yaml`
-- **Test Running:** `newman`, `newman-reporter-htmlextra`
-- **ID Generation:** `uuid`
+CI runs lint and tests on Ubuntu, Windows and macOS with Node 22 and 24.
 
----
+## Known limitations
 
-## Contributing
-
-1. Add new test patterns → `src/generators/test-script-generator.js`
-2. Modify collection structure → `src/generators/positive-generator.js` / `negative-generator.js`
-3. Add new output formats → create a generator in `src/generators/`
-4. Add new validators → create a checker in `src/validators/`
-5. Add new MCP tools → `index.js`
-
----
+- BDD output is specification-level Gherkin; no step definitions are generated.
+- If a broken API wrongly accepts an invalid POST from the negative suite, the
+  record it creates is not cleaned up (the test still fails).
+- Path parameters whose collection has no create or list endpoint are read from
+  the environment; update/delete on those resources are skipped unless
+  `allowMutationOfExistingData=true`.
+- Examples use the first `oneOf`/`anyOf` branch; field-level negative tests cover
+  JSON object bodies only.
+- Formats the Postman sandbox does not know (e.g. `int32`, `byte`) are not
+  enforced by the contract checks.
 
 ## License
 

@@ -1,78 +1,26 @@
-# How to Run the Swagger-to-Postman MCP Server
+# How to Run
 
 ## Prerequisites
 
-- **Node.js** >= 18.0.0
-- An MCP-compatible client (Claude Desktop, VS Code with MCP extension, etc.)
+- Node.js 22 or newer
+- `npm ci` in the project directory
 
-## Installation
+## MCP server
 
-```bash
-cd swagger-to-postman-mcp
-npm install
-```
-
-## Running the Server
-
-### Option 1: Direct execution
+The server speaks MCP over stdio; it waits silently for a client.
 
 ```bash
-node index.js
+npm start                                          # node index.js
+npx @modelcontextprotocol/inspector node index.js  # browser UI for manual tool calls
 ```
 
-### Option 2: npm script
+### Claude Code
 
 ```bash
-npm start
+claude mcp add swagger-to-postman -- node /full/path/to/swagger-to-postman-mcp/index.js
 ```
 
-### Option 3: Watch mode (auto-restart on file changes)
-
-```bash
-npm run dev
-```
-
-The server communicates over **stdio** (standard input/output). You will not see a running prompt — this is expected. The server waits for MCP protocol messages.
-
-### Option 4: Test with MCP Inspector (browser UI)
-
-```bash
-npx @modelcontextprotocol/inspector node index.js
-```
-
-This opens a browser-based UI where you can call each tool interactively and inspect responses — useful for testing without a full MCP client.
-
----
-
-## Connecting via Claude Desktop
-
-Add the server to your Claude Desktop config file:
-
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "swagger-to-postman": {
-      "command": "node",
-      "args": ["/path/to/swagger-to-postman-mcp/index.js"]
-    }
-  }
-}
-```
-
-Restart Claude Desktop after saving. The tools will appear automatically.
-
----
-
-## Connecting via Claude Code (CLI)
-
-```bash
-claude mcp add swagger-to-postman node /full/path/to/swagger-to-postman-mcp/index.js
-```
-
-Or add it to your project's `.mcp.json`:
+or in a project's `.mcp.json`:
 
 ```json
 {
@@ -85,108 +33,77 @@ Or add it to your project's `.mcp.json`:
 }
 ```
 
----
+### Claude Desktop
 
-## Available Tools
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
-| Tool | Description |
-|------|-------------|
-| `list_swagger_files` | List OpenAPI/Swagger specs in the `swagger/` directory |
-| `analyze_openapi` | Parse a spec and inspect its structure (no file output) |
-| `validate_spec` | Validate an OpenAPI spec before generating tests |
-| `generate_tests` | Generate full Postman test suite (positive + negative + environment + report) |
-| `verify_collection` | Check variable completeness, test script syntax, and coverage |
-| `generate_bdd` | Generate BDD Gherkin `.feature` files from an OpenAPI spec |
+```json
+{
+  "mcpServers": {
+    "swagger-to-postman": {
+      "command": "node",
+      "args": ["C:\\full\\path\\to\\swagger-to-postman-mcp\\index.js"],
+      "env": { "SWAGGER_MCP_ALLOWED_DIRS": "C:\\specs;C:\\work\\api-tests" }
+    }
+  }
+}
+```
 
----
+### Which files can the server touch?
 
-## Usage Examples
+Only files inside the allowed roots:
 
-### 1. List available specs
+1. the roots your MCP client exposes (usually the open workspace),
+2. this project directory (bundled `swagger/` specs, default `generated/` output),
+3. directories listed in `SWAGGER_MCP_ALLOWED_DIRS`.
 
-Ask your AI client:
-> "List the swagger files available"
+Relative paths resolve against the first root. `generate_tests` and
+`generate_bdd` refuse to overwrite existing files unless called with
+`overwrite: true`.
 
-### 2. Validate a spec
+### Example prompts
 
-> "Validate the spec at `./swagger/my-api.yaml`"
+> "Validate swagger/restful_booker.json"
+> "Generate tests from ./specs/orders.yaml into ./api-tests with a CSV data file"
+> "Verify ./api-tests/Orders_API_Positive.postman_collection.json against ./api-tests/Orders_API_environment.json"
 
-### 3. Generate tests
-
-> "Generate tests from `./swagger/my-api.yaml` and save to `./output`"
-
-With custom variables:
-> "Generate tests from `./swagger/my-api.yaml` with variables `{"baseUrl": "https://api.example.com", "username": "admin"}`"
-
-Reusing an existing environment file:
-> "Generate tests from `./swagger/my-api.yaml` reusing values from `./generated/MyAPI_environment.json`"
-
-### 4. Generate BDD feature files
-
-> "Generate BDD tests from `./swagger/my-api.yaml`"
-
-### 5. Verify a collection
-
-> "Verify `./generated/MyAPI_Positive.postman_collection.json` against `./generated/MyAPI_environment.json`"
-
----
-
-## Running Generated Collections with Newman
-
-After generating tests, run them headlessly with Newman:
+## CLI
 
 ```bash
-# Install Newman (already in devDependencies)
-npm install
-
-# Run positive tests
-npx newman run generated/MyAPI_Positive.postman_collection.json \
-  -e generated/MyAPI_environment.json
-
-# Run negative tests
-npx newman run generated/MyAPI_Negative.postman_collection.json \
-  -e generated/MyAPI_environment.json
-
-# Run with HTML report
-npx newman run generated/MyAPI_Positive.postman_collection.json \
-  -e generated/MyAPI_environment.json \
-  -r htmlextra --reporter-htmlextra-export results.html
-
-# Run with iteration data file
-npx newman run generated/MyAPI_Positive.postman_collection.json \
-  -e generated/MyAPI_environment.json \
-  --iteration-data generated/MyAPI_iteration_data.json
+node generate.js <spec> [output-dir] [--data-file csv|json] [--row-count n] \
+  [--variables '<json>'|file.json] [--env-file env.json] [--response-time ms] [--bdd] [--no-overwrite]
 ```
 
----
+## Running the generated suites
 
-## Project Structure
+```bash
+npx newman run generated/<API>_Positive.postman_collection.json -e generated/<API>_environment.json
+npx newman run generated/<API>_Negative.postman_collection.json -e generated/<API>_environment.json
 
-```
-swagger-to-postman-mcp/
-├── index.js              # MCP server entry point
-├── generate.js           # Core generation utilities
-├── swagger/              # Place your OpenAPI specs here (.yaml, .json, .txt)
-├── generated/            # Output directory for generated files
-└── src/
-    ├── parsers/          # OpenAPI spec parsers
-    ├── generators/       # Collection, BDD, HTML, data file generators
-    ├── validators/       # Variable, coverage, script checkers
-    └── utils/            # Shared utilities
+# data-driven
+npx newman run generated/<API>_Positive.postman_collection.json -e generated/<API>_environment.json \
+  --iteration-data generated/<API>_iteration_data.csv
+
+# HTML report
+npx newman run generated/<API>_Positive.postman_collection.json -e generated/<API>_environment.json \
+  -r cli,htmlextra --reporter-htmlextra-export results.html
 ```
 
----
+Set `baseUrl` and credentials in the environment file first. Collection
+variables you can override from the environment:
 
-## Supported Spec Formats
-
-- OpenAPI 3.x (`.yaml`, `.json`)
-- Swagger 2.x (`.yaml`, `.json`)
-- Plain text files (`.txt`) — the server will auto-detect and extract the spec
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `responseTimeThresholdMs` | `5000` | Performance assertion threshold |
+| `allowMutationOfExistingData` | `false` | Let update/delete run on records the run did not create |
 
 ## Troubleshooting
 
-**Server exits immediately:** This is correct behavior — the MCP server only runs while a client is connected via stdio.
-
-**`swagger/` directory not found:** Create it and place your spec files inside before calling `list_swagger_files`.
-
-**`Error: Cannot find module`:** Run `npm install` to install dependencies.
+- **`Access denied: ... outside the allowed directories`**: add the directory to
+  `SWAGGER_MCP_ALLOWED_DIRS` or open it as a workspace root in your client.
+- **`Refusing to overwrite existing files`**: pass `overwrite: true` or pick another output directory.
+- **`[SKIPPED]` lines in Newman output**: a request's prerequisite (a captured id,
+  or a resource created by this run) was missing; the line says which.
+- **`Unable to resolve $ref pointer`**: external `$ref`s must be files inside the
+  spec's folder; `http(s)` refs are not fetched.
